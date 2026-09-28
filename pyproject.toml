@@ -1,0 +1,42 @@
+[project]
+name = "admin-master-control"
+version = "0.1.0"
+description = "FileEngine deployment-tier administration: cross-tenant observation, the queue of decisions awaiting a human, and the record of what was decided"
+license = {text = "AGPL-3.0-or-later"}
+authors = [{name = "James Hickman", email = "james@rationalboxes.com"}]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "ldap3>=2.9",              # system_* role resolution, outside every tenant OU
+    "psycopg[binary]>=3.1",    # its own database: queue state and decisions, nothing else
+    "redis>=5.0",              # the audit stream, for latency only (see below)
+    "pydantic>=2.0",
+    "PyJWT>=2.8",              # bearer verification; a DISTINCT audience from every tenant door
+    "httpx>=0.27",             # reads other services through their APIs, never their schemas
+]
+# Deliberately NOT depended on:
+#
+#   python_interface (the gRPC core client) is needed only for storage usage and
+#   tenant existence, as a READ-ONLY service principal. Add it when §3.1 needs
+#   it, not before — this application must not accumulate reach it has no use
+#   for today.
+#
+#   Nothing that can delete from any bucket, and no cloud SDK. See
+#   design_documents/PROPOSAL_system_administration_application.md §4.
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "httpx>=0.27"]
+
+[project.scripts]
+admin-master-control = "admin_master_control.app:main"   # API (:8103), monitoring (:8104)
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = ["live: integration test that needs LDAP + Postgres + the audit ledger reachable"]
