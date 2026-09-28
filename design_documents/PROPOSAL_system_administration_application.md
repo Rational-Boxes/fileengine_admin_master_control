@@ -166,6 +166,31 @@ the CLI or `ldap_manager` carries out. The gap between deciding and acting
 remains deliberate even here, and the argument for it is stronger rather than
 weaker under pressure.
 
+### 3.4a Tenant setup and management
+
+The deployment tier's most frequent operation, and today a manual sequence:
+`tenant.yml`, then DNS, then confirming the vhost and the certificate, then the
+MCP host allow-list. In scope here — **requested in this application, executed
+by a runner** (§5.3).
+
+What the application owns:
+
+- **The request**, with its inputs validated (§5.3.1) — tenant id, the initial
+  administrator, the hostnames.
+- **The state**, which is the point: `requested → provisioning → awaiting DNS →
+  verifying → live`, or `failed` with which step and why. A tenant part-way
+  through creation is exactly the *outstanding* thing §3.2 exists for, and it is
+  currently tracked in somebody's terminal scrollback.
+- **The outstanding manual steps**, shown rather than assumed. If DNS is not
+  ours, the application says so, shows the record to create, and polls until it
+  resolves — instead of reporting success at four fifths.
+- **Day-to-day management** afterwards: seats, quota, the tenant's own
+  administrators, and whether its backup last verified.
+
+What it does **not** own: the credentials, the execution, or the decision to
+destroy. Decommissioning a tenant is destructive and belongs with §3.5's phase-4
+work, behind the same re-authentication.
+
 ### 3.5 The tenant-admin exclusions
 
 Full account deletion, per-user 2FA teardown — the highest-tier tasks the tenant
@@ -261,13 +286,54 @@ The one write this application makes is its own queue state (§3.2) — and that
 asymmetry, reads everywhere and writes in one place, is what keeps §4's
 boundaries checkable rather than aspirational.
 
+### 5.3 The runner, and why it is not this application
+
+Driving Ansible from a web process would put the vault password, the DNS API key
+and the cloud credentials inside a browser-facing application — the highest
+concentration of authority in the estate, behind a session. §4 forbids it, and
+tenant creation does not need it.
+
+Instead: the application writes a **job**; a small runner on the host claims it,
+executes the playbook, and reports state back. The runner holds the credentials;
+the application holds none and knows only that it asked. The same request /
+execute split the redaction design uses, for the same reason.
+
+#### 5.3.1 What running a playbook from a UI actually risks
+
+Naming these because they are not obvious from "run the playbook", and each has
+a cheap answer:
+
+| Risk | Answer |
+|---|---|
+| **Injection through the tenant id.** It becomes a Postgres schema name, an LDAP OU, a hostname and a container label. A crafted value reaches four interpreters. | Validate against a strict pattern at the boundary — `^[a-z][a-z0-9-]{1,30}$` — and pass parameters via `--extra-vars` as JSON, never by string interpolation into a command. |
+| **Concurrency.** Two overlapping plays against the same inventory is not a supported state, and `deploy.sh --service X` has already shown that a targeted run can ship different variables from a full one. | One runner, one job at a time, a lock the application cannot bypass. Queued, not parallel. |
+| **Duration.** A playbook is minutes; an HTTP request is not. | It is a job with state (§3.4a), not a request that blocks. This is the queue again. |
+| **Output is not safe to stream.** Playbook output carries vault-decrypted values, passwords and connection strings. | The runner returns a *status and a step*, not a transcript. Full output stays on the host, readable by someone with host access — which is the audience for it. |
+| **Partial failure.** A half-created tenant is worse than none: an LDAP OU with no schema, or a vhost with no certificate. | The playbook is already idempotent, so the answer is to re-run rather than to unwind. The state must therefore distinguish *failed, safe to retry* from *failed, needs a human* — and default to the latter. |
+| **Certificate rate limits.** Let's Encrypt allows a limited number of certificates per domain per week. A create button that can be clicked repeatedly, or a retry loop, can exhaust that for **every** tenant, not just the one being created. | Retries are rate-limited by the application and a failed certificate step does not auto-retry. This is the one failure here with blast radius beyond the tenant involved. |
+
+#### 5.3.2 The runner is a deployment component, not part of this repository
+
+It runs on the host, holds secrets, and executes Ansible — it belongs with
+`scripts/Ansible` and the deployment's own trust boundary, not inside a
+browser-facing application. This proposal specifies the contract between them
+(a job, a state, a result) and nothing about how the runner is built.
+
 ## 6. Authentication
 
 **LDAP roles outside every tenant's scope**, per the decision recorded in the
-scoping document §6. Four tiers are suggested there — `system_observer`,
-`system_operator`, `system_security`, `system_owner` — and the split matters
-because most deployment work needs only the first, while a role required for
-everything gets used for everything.
+scoping document §6. They divide by **responsibility rather than seniority** —
+`system_observer` (read-only, the baseline), `system_tenants`, `system_security`,
+`system_billing`, and `system_owner` which grants the others — and they are
+additive and unordered, so a large deployment can give each administrator one
+area while a small one gives one person all of them.
+
+Two consequences for this application specifically: a route is authorised by a
+**named role rather than by a tier**, so there is no ordering to get wrong and
+no implicit inheritance; and every action records **which role authorised it**,
+because a person holding three roles who approves a redaction did so as
+`system_security`, and that distinction is what makes the decision auditable a
+year later.
 
 Requirements specific to this application:
 

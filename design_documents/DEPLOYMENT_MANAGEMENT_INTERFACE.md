@@ -83,21 +83,38 @@ Applied:
 |---|---|
 | Approve a redaction; acknowledge a security incident | **Interface** — decision |
 | Review tenant state, storage, incidents, credential expiry | **Interface** — observation |
-| Provision or decommission a tenant | **Playbook**, shown by the interface. §3.1 |
+| Provision or decommission a tenant | **Requested in the interface, executed by the runner** (§3.1). Decommissioning is destructive and lands with the §5 phase-4 work, not with creation. |
 | Deploy, take a snapshot, restore | **Playbook.** A restore should be a decision, not a button — RESTORE.md already says why |
 | Issue or rotate a service credential | **CLI**, shown by the interface |
 | Full account deletion, per-user 2FA teardown | **Interface** — the tasks the tenant-admin app deliberately excludes, and they need an audit trail more than they need a command |
 
-### 3.1 Why tenant creation stays a playbook
+### 3.1 Tenant lifecycle is in scope — the application requests, a runner executes
 
-`tenant.yml`'s own header is the argument: five things must happen for a tenant
-to exist, "and only four of them are ours" — DNS is managed outside Ansible. A
-UI that wrapped the playbook would have to either hold DNS credentials, which a
-web application should not, or present an operation that silently completes four
-fifths of the way.
+*(Revised. An earlier version of this section argued tenant creation should stay
+a playbook the interface merely observes. That was too strong, and the reasoning
+behind it survives in a better shape.)*
 
-The honest shape is the interface **requesting** a tenant and showing the
-outstanding steps — which is §2.1 again, not a wrapper.
+Tenant setup is the deployment tier's most frequent operation and today it is a
+manual sequence: run `tenant.yml`, arrange DNS, confirm the vhost and the
+certificate, check the MCP host allow-list. Automating it is real value and the
+interface is the right place to drive it from.
+
+**What was right in the original objection** is that a web application must not
+hold the credentials that do it. `tenant.yml`'s own header says five things must
+happen "and only four of them are ours" — DNS is outside Ansible — and a UI
+holding a DNS API key, a vault password and cloud credentials is the highest
+concentration of authority in the estate sitting behind a browser session.
+
+**So the split is the same one the redaction design uses:** the application
+records the *intent* and a **runner** executes it (§5.1 of the application
+proposal). The runner holds the vault password and the cloud credentials; the
+application holds none and knows only that it asked. The gap between *requested*
+and *done* is the same gap §4 keeps everywhere else, and it is what stops a
+browser session being a route to the deployment's secrets.
+
+That also makes tenant creation fit §2.1 rather than contradict it: a tenant
+that is requested, provisioning, awaiting DNS, or live is precisely a thing that
+is **outstanding**, which is the capability nothing else in the estate has.
 
 ---
 
@@ -150,23 +167,52 @@ Role membership is already request-borne from LDAP groups — the core's
 `user_roles` is effectively always empty — so this needs no new mechanism, only
 a placement and a discipline.
 
-### 6.1 A tier, not a role
+### 6.1 Responsibilities, not a ladder
 
-One all-powerful account is the wrong shape for the same reason `tenant_admin`
-is not one permission: most deployment work does not need most of the power, and
-a role that is required for everything gets used for everything. A suggested
-split, to be argued rather than adopted:
+*(Revised. An earlier version proposed four roles that read as levels —
+observer, operator, security, owner. That was the wrong shape: deployment work
+divides by **responsibility**, not by seniority, and a large deployment has
+several administrators each holding one area.)*
+
+One all-powerful account is wrong for the same reason `tenant_admin` is not one
+permission. But so is a ladder: a billing administrator does not need tenant
+provisioning, and a security administrator does not need to alter invoices.
+
+**Four orthogonal roles, plus one that can grant them:**
 
 | Role | Holds |
 |---|---|
-| `system_observer` | read-only across tenants — §5 phase 1, and the one most people need |
-| `system_operator` | acknowledge signals, request tenant lifecycle, run recovery points |
-| `system_security` | approve redactions, review incidents, revoke credentials |
-| `system_owner` | the god tier: grant the roles above, destructive account operations, anything with no undo |
+| `system_observer` | Read-only across everything. The baseline, and what most people actually need — most deployment work is looking. |
+| `system_tenants` | Tenant setup, lifecycle and day-to-day management: request provisioning, seats, quota, the tenant's own administrators. |
+| `system_security` | Monitoring and security: incidents, cross-tenant detection, acknowledgements, redaction approval, credential revocation. |
+| `system_billing` | Metering, statements, plan changes. |
+| `system_owner` | Grants the four above. The only role that can create authority. |
 
-The point of separating them is that `system_owner` should be **rare, and
-auditable by the others**. A tier nobody can observe is a tier nobody can
-review.
+**They are additive and unordered.** Holding `system_billing` grants nothing in
+tenants or security. A person may hold several; on a small deployment one person
+holds all of them, and the model does not get in the way. The point is that on a
+large one it *can* be divided, and that dividing it requires no redesign.
+
+#### Why separation here is worth the extra roles
+
+- **Redaction approval and tenant provisioning are different jobs.** The
+  redaction design assumes an administrator separate from whoever holds droplet
+  root; separating security from tenant operations is the same argument one
+  level up.
+- **Billing is a financial-fraud surface.** Someone who can alter what a
+  customer is billed is a distinct risk from someone who can read usage, so
+  *viewing* metering (`system_observer`) and *changing* a plan or reissuing a
+  statement (`system_billing`) are deliberately different grants. Statements are
+  immutable regardless, which limits what the role can do even when held.
+- **Least privilege has somewhere to land.** Without these, every deployment-tier
+  task needs the one role that does everything, and it gets handed out.
+
+#### What the audit record must carry
+
+Every action records **which role authorised it**, not only who performed it. A
+person holding three roles who approves a redaction did so as `system_security`,
+and a year later that is the difference between an auditable decision and a name
+with unclear standing.
 
 ### 6.2 Two invariants, and a live risk to the first
 
@@ -204,7 +250,9 @@ the namespace, beyond tidiness.
 No tenant admin may create a deployment role or grant membership of one.
 `system_owner` grants the others; the first `system_owner` comes from
 provisioning, the way a tenant's first administrator already does in
-`tenant.yml`. Accounts live outside every tenant OU, alongside `ou=services`.
+`tenant.yml`. A `system_owner` granting themselves another role is legitimate
+and must be **recorded as a grant**, not silently effective — otherwise the
+separation above is a convention rather than a control. Accounts live outside every tenant OU, alongside `ou=services`.
 
 ---
 
