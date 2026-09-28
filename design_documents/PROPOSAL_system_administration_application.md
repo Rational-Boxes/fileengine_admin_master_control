@@ -336,12 +336,37 @@ every door would then call a **management console on every login**, so a console
 outage becomes a platform outage. A tool for supervising the platform must never
 become a dependency of it.
 
-It belongs in the platform — a `tenants` table with the state and its history,
-in the core's **global** (non-tenant) schema, where tenant lifecycle is already
-a first-class concept: `AuditScope::Global` exists for it and `tenant` is
-already an audit target type in its own right. This application **writes
-transitions** through the same request/execute path as everything else, and
-reads for display. It does not own the state; it drives it.
+It belongs in the platform — **the core's global schema** *(decided)*, where
+tenant lifecycle is already a first-class concept: `AuditScope::Global` exists
+for it and `tenant` is already an audit target type in its own right. This
+application **writes transitions** through the same request/execute path as
+everything else, and reads for display. It does not own the state; it drives it.
+
+**A global `tenants` registry already exists** (`database.cpp:121`), carrying
+`tenant_id`, `schema_name` and timestamps beside `audit_log_global` and the
+global accountability chain. So this is an **additive migration to an existing
+table**, in the `ADD COLUMN IF NOT EXISTS` style the platform uses everywhere —
+not a new concept and not a new home:
+
+```sql
+ALTER TABLE tenants
+  ADD COLUMN IF NOT EXISTS state       VARCHAR(16) NOT NULL DEFAULT 'live',
+  ADD COLUMN IF NOT EXISTS state_since TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS state_by    VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS state_note  TEXT;
+```
+
+**`DEFAULT 'live'` is the only safe backfill**, and it is right rather than
+merely convenient: every tenant that exists today is in service, and a
+migration that defaulted to anything else would lock out the entire deployment
+on the first login after it ran. The same reasoning as the storage pipeline's
+transform backfill — a migration cannot know what it was not told, so it must
+assert only what is already true.
+
+History goes in the audit chain rather than in a second table. Transitions are
+already `scope = Global`, `target_type = tenant` events with an actor, which is
+the record; a `tenant_state_history` table would be a second, unchained copy of
+something the platform already keeps tamper-evidently.
 
 **One authoritative source, not two.** The tempting alternative is an attribute
 on the tenant's LDAP OU, since every door already resolves roles from LDAP at
@@ -642,12 +667,10 @@ a real cost, rather than because it is technically possible.
 
 ## 11. Open questions
 
-**Q0 — Who owns the tenant state table?** (§3.4c.) It belongs in the platform
-rather than in this application, and the core's global schema is the natural
-home — but that is a change to `file_engine_core`, and the core has been kept
-deliberately unaware of several things that looked like its business. Worth
-settling early, because §3.4a, §3.4b and every door's login check all depend on
-the answer.
+**Q0 — Who owns the tenant state table? Settled: the core's global schema.**
+An additive migration to the `tenants` registry that already lives there
+(§3.4c). The core learns a lifecycle state it already emits audit events about;
+it learns nothing about what the state is *for*, which is where the line sits.
 
 **Q1 — Does the tenant list come from LDAP or the core?** Both know about
 tenants and neither is obviously authoritative. Worth settling before §3.1 is
