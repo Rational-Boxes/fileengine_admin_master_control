@@ -308,6 +308,83 @@ global lifecycle chain has something to point at. So the platform can still
 answer "when was this tenant decommissioned, by whom, and on whose authority"
 after everything it held is gone.
 
+### 3.4c Tenant state, and the doors that must honour it
+
+Everything in §3.4a and §3.4b implies a **tenant state** that outlives any one
+operation, and a **check at login**. This is the part of the work that reaches
+outside this application, and it should be treated as the riskiest part of it:
+it touches every access point, and every access point is where the tenant
+boundary is enforced.
+
+#### The states
+
+```
+requested → awaiting_dns → provisioning → live
+                                            ├─ suspended ──┐ (reversible)
+                                            └──────────────┴→ decommissioning → decommissioned
+```
+
+Only **`live` admits a user.** Everything else refuses — including
+`provisioning`, because a tenant that is half-built should not be reachable, and
+including `decommissioned`, because the row survives the data (§3.4b) and must
+not become a way back in.
+
+#### Where it lives, and why not in this application
+
+The obvious place is this application's own database. It is the wrong place:
+every door would then call a **management console on every login**, so a console
+outage becomes a platform outage. A tool for supervising the platform must never
+become a dependency of it.
+
+It belongs in the platform — a `tenants` table with the state and its history,
+in the core's **global** (non-tenant) schema, where tenant lifecycle is already
+a first-class concept: `AuditScope::Global` exists for it and `tenant` is
+already an audit target type in its own right. This application **writes
+transitions** through the same request/execute path as everything else, and
+reads for display. It does not own the state; it drives it.
+
+**One authoritative source, not two.** The tempting alternative is an attribute
+on the tenant's LDAP OU, since every door already resolves roles from LDAP at
+login and the check would be nearly free. The reason to resist it is that state
+would then exist in two places with two write paths, and the failure is silent:
+a tenant suspended in one and live in the other stays reachable through whichever
+door reads the stale copy. If the LDAP attribute is wanted as a *cache*, it must
+be derived and never authored.
+
+#### The check, and the four properties it needs
+
+1. **Fail closed.** A state that cannot be determined refuses the login. The
+   failure that matters is a suspended tenant admitted because a lookup
+   errored — and "allow on error" is how that happens.
+2. **At every door, not one.** `http_bridge`, `webdav_bridge`, the MCP door, and
+   any integration path. The platform's own rule is that the core is
+   trusted-upstream and read-by-default, so **each door alone enforces
+   membership**; tenant state is the same shape, and a check in the SPA alone
+   leaves WebDAV and MCP open.
+3. **Cheap, and invalidated rather than merely expiring.** A lookup per request
+   is unnecessary; a long cache means a suspension takes effect whenever it
+   feels like it. The pattern already exists in this platform —
+   `convert_search_ai`'s permission cache is TTL-bounded at five minutes **and**
+   invalidated in real time by the core's events. A `tenant.state_changed` event
+   gives suspension the same immediacy.
+4. **Refuse with a distinct, honest status.** A suspended tenant is not a bad
+   password, and a user told "invalid credentials" will try again, then call
+   support, who will also not know. This is one of the few refusals where
+   saying why is right: it is the tenant's own state and the user is entitled
+   to it.
+
+#### Why this is the risky part
+
+The last time something was added across every door, a local shortcut in one of
+them plus a flattened role search let a member of one tenant administer another
+(fixed as 1.9.17). Adding a check to N doors is N chances to add it subtly
+differently, and one chance to forget a door entirely.
+
+So: **shared code rather than N implementations** wherever the doors' languages
+allow it, and **a test per door** asserting that a suspended tenant is refused —
+written before the state is ever used for anything, because the door that nobody
+wrote a test for is the door that will still be open.
+
 ### 3.5 The tenant-admin exclusions
 
 Full account deletion, per-user 2FA teardown — the highest-tier tasks the tenant
@@ -564,6 +641,13 @@ Worth revisiting when tenant creation is frequent enough that the manual step is
 a real cost, rather than because it is technically possible.
 
 ## 11. Open questions
+
+**Q0 — Who owns the tenant state table?** (§3.4c.) It belongs in the platform
+rather than in this application, and the core's global schema is the natural
+home — but that is a change to `file_engine_core`, and the core has been kept
+deliberately unaware of several things that looked like its business. Worth
+settling early, because §3.4a, §3.4b and every door's login check all depend on
+the answer.
 
 **Q1 — Does the tenant list come from LDAP or the core?** Both know about
 tenants and neither is obviously authoritative. Worth settling before §3.1 is
