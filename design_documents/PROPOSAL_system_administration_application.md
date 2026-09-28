@@ -240,6 +240,74 @@ What it does **not** own: the credentials, the execution, or the decision to
 destroy. Decommissioning a tenant is destructive and belongs with §3.5's phase-4
 work, behind the same re-authentication.
 
+### 3.4b Tenant decommissioning
+
+In scope, and the most dangerous operation this application will hold. Two
+phases, because they are two decisions:
+
+| Phase | Effect | Reversible |
+|---|---|---|
+| **Suspend** | Access refused at every door. Nothing is destroyed. | Yes, entirely |
+| **Decommission** | Schemas, directory entries, vhost, certificate and content destroyed. | No |
+
+Commercially this is how it happens anyway — a customer leaves, the account is
+suspended, a notice or dispute period runs, and only then is anything destroyed.
+Modelling it as one button collapses that into a moment when someone is annoyed.
+
+#### The fan-out nobody currently enumerates
+
+Decommissioning is not one operation. A tenant has a schema in the **core** and
+in every service that ever provisioned one for it — `convert_search_ai`,
+`discussion`, `folder_actions`, `share_service`, `difference_service`,
+`audit_service`, and whatever is added next. The core has
+`cleanup_tenant_data`; there is **no operation that means "and everywhere
+else"**, and nothing anywhere lists who the participants are.
+
+So a service added a year from now, which nobody thinks to add to a teardown
+list, keeps that tenant's data indefinitely — silently, after the platform has
+reported the tenant destroyed. That is this platform's characteristic failure
+applied to data that was specifically supposed to be gone.
+
+**The answer already exists in the codebase.** Erasure solved the same problem
+with a participant roster and acknowledgements: `erasure_ack` records each
+participant complying, with `complied = false` recorded rather than silence, and
+the roster is frozen at initiation so a config change cannot quietly shrink it.
+Decommissioning should use the same shape — **a decommission is not complete
+until every participant has acknowledged**, and one that cannot reach a
+participant stays incomplete and visible rather than reporting success.
+
+#### What decommissioning does not reach
+
+**The offsite backup**, for exactly the reason erasure does not: the bucket
+denies deletion to everything but a break-glass role, and the mirror never
+removes. So a decommissioned tenant's content survives there.
+
+That is correct — it is what the copy is for — and it means a departing customer
+who asks for their data to be destroyed is a **redaction**, routed through
+`redaction_manager`, not a consequence of pressing decommission. The application
+must say so at the point of decommissioning rather than leaving the operator to
+assume otherwise.
+
+#### Confirmation discipline
+
+- **`system_tenants` plus re-authentication.** Holding the role is not consent
+  to this particular act.
+- **The tenant id typed, not a checkbox.** The realistic failure here is the
+  right operation on the wrong tenant.
+- **A hold period between suspend and destroy**, with the destroy step requiring
+  a human to return — the same reasoning as the redaction hold, and the same
+  refusal to let anything destructive run unattended.
+- **An export offered first.** A customer leaving usually wants their data, and
+  the moment after destruction is the worst time to discover that.
+
+#### What survives
+
+The tenant's *data* goes; the *record* does not. `AuditScope::Global` exists for
+exactly this — tenant create and delete are targets in their own right, and the
+global lifecycle chain has something to point at. So the platform can still
+answer "when was this tenant decommissioned, by whom, and on whose authority"
+after everything it held is gone.
+
 ### 3.5 The tenant-admin exclusions
 
 Full account deletion, per-user 2FA teardown — the highest-tier tasks the tenant
@@ -439,7 +507,8 @@ prerequisites rather than scope.
 2. **Acknowledgement** (§3.2). Queue state, backlog metric, the notifier from
    §7.3 pointing at it.
 3. **Approval** (§3.3). Redaction confirm/approve. Still executes nothing.
-4. **The destructive exclusions** (§3.5), and `system_owner` role granting —
+4. **The destructive work** — decommissioning (§3.4b), the tenant-admin
+   exclusions (§3.5), and `system_owner` role granting —
    the single most dangerous capability proposed here, since it is the one that
    can create its own authority. It deserves its own review, and there is a
    reasonable argument that it should stay in provisioning permanently rather
@@ -468,7 +537,33 @@ For the review §2 and §4 argue this needs, before it is reachable:
 
 ---
 
-## 10. Open questions
+## 10. Future: direct DNS integration
+
+**Not now — recorded so it is revisited deliberately.**
+
+The workflow in §3.4a has the administrator update the zone by hand. A later
+version could talk to a DNS management API directly — cPanel, Route 53,
+Cloudflare — and create the records itself, turning tenant creation into one
+step instead of three.
+
+The reason to hold it is worth writing down, because "it would be more
+automated" will sound like an unambiguous improvement later:
+
+- **It reintroduces exactly the credential this design avoids.** The current
+  shape holds no DNS credential because it performs no DNS operation. An
+  integration means a browser-facing application with authority over the zone —
+  and authority over the zone is authority over every certificate, every
+  hostname and, with it, a great deal else.
+- **It is a trade, not an upgrade.** The gain is one manual step in an operation
+  performed occasionally. The cost is a permanent, high-value credential.
+- **If it is built, the runner is where it belongs** (§5.3), not the
+  application — the same separation that keeps the vault password out of the
+  web process.
+
+Worth revisiting when tenant creation is frequent enough that the manual step is
+a real cost, rather than because it is technically possible.
+
+## 11. Open questions
 
 **Q1 — Does the tenant list come from LDAP or the core?** Both know about
 tenants and neither is obviously authoritative. Worth settling before §3.1 is
