@@ -106,9 +106,15 @@ holding a DNS API key, a vault password and cloud credentials is the highest
 concentration of authority in the estate sitting behind a browser session.
 
 **So the split is the same one the redaction design uses:** the application
-records the *intent* and a **runner** executes it (§5.1 of the application
-proposal). The runner holds the vault password and the cloud credentials; the
-application holds none and knows only that it asked. The gap between *requested*
+records the *intent* and a **runner** executes it (§5.3 of the application
+proposal). The runner holds the vault password; the application holds none and
+knows only that it asked.
+
+**And DNS stays with the human entirely.** The administrator updates the zone
+wherever the domain is managed; the application shows the records to create,
+verifies they have propagated, and only then allows the playbook to be invoked.
+There is no DNS credential to hold because there is no DNS operation to perform
+— which disposes of the original objection rather than mitigating it. The gap between *requested*
 and *done* is the same gap §4 keeps everywhere else, and it is what stops a
 browser session being a route to the deployment's secrets.
 

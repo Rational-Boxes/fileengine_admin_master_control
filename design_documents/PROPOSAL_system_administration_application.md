@@ -173,17 +173,66 @@ The deployment tier's most frequent operation, and today a manual sequence:
 MCP host allow-list. In scope here — **requested in this application, executed
 by a runner** (§5.3).
 
+#### The workflow
+
+DNS is managed wherever the domain is, by a human, and **the application never
+touches it**. That removes the objection the earlier draft raised entirely:
+there is no DNS credential to hold because there is no DNS operation to perform.
+
+1. The administrator requests a tenant. The application shows **exactly the
+   records to create** — `<tenant>.<base>` and `<tenant>-drive.<base>`, with the
+   address they must point at — in a form meant for pasting into a zone file.
+2. The administrator updates the zone wherever the domain is managed.
+3. The application **verifies propagation** (below), and until it passes the
+   run is blocked.
+4. The administrator invokes the playbook from the UI; the runner executes it.
+
+State is therefore `requested → awaiting DNS → verified → provisioning → live`,
+or `failed` with which step and why. DNS comes **before** provisioning rather
+than during it, which is the part the earlier draft had wrong.
+
+#### The DNS check is a gate, not a status indicator
+
+This is the affordance that earns its place, and the reason is not convenience.
+
+`tenant.yml` provisions an nginx vhost and a Let's Encrypt certificate per
+hostname. Issuance validates that the name resolves to this host and answers on
+port 80. **Run the playbook before DNS has propagated and the certificate step
+fails — and failed issuance consumes the domain's rate limit, which is shared by
+every tenant.** A create button that can be pressed early is a button that can
+exhaust certificate issuance for the whole deployment, not just for the tenant
+being created (§5.3.1).
+
+So the check blocks the run, and it has to be an honest one:
+
+- **Query the zone's authoritative nameservers, not the local resolver.** A
+  cached NXDOMAIN blocks a record that has in fact propagated; a local override
+  or a search-domain quirk shows a success the world does not see. Asking the
+  authority is the only answer that means anything.
+- **Check the address, not merely that something resolves.** A name pointing at
+  the previous host resolves perfectly and issues nothing.
+- **Check every hostname the tenant needs**, not just the first. A missing
+  `<tenant>-drive` fails later and less legibly.
+- **Where practical, verify what the CA will verify** — that the host answers
+  on port 80 for that name. DNS being right while the vhost or the firewall is
+  not is a distinct failure, and it fails at exactly the same step.
+
+#### The override, and why it is recorded
+
+There are legitimate reasons the check fails on a correct setup — split-horizon
+DNS, a CDN in front, a zone the administrator does not control but has been
+told is ready. So an override exists. It requires `system_tenants`, it records
+who overrode and why, and it is the one path to provisioning that can burn the
+rate limit — which is precisely why it is a deliberate act with a name attached
+rather than a retry.
+
 What the application owns:
 
 - **The request**, with its inputs validated (§5.3.1) — tenant id, the initial
   administrator, the hostnames.
-- **The state**, which is the point: `requested → provisioning → awaiting DNS →
-  verifying → live`, or `failed` with which step and why. A tenant part-way
-  through creation is exactly the *outstanding* thing §3.2 exists for, and it is
-  currently tracked in somebody's terminal scrollback.
-- **The outstanding manual steps**, shown rather than assumed. If DNS is not
-  ours, the application says so, shows the record to create, and polls until it
-  resolves — instead of reporting success at four fifths.
+- **The state**, above. A tenant part-way through creation is exactly the
+  *outstanding* thing §3.2 exists for, and today it is tracked in somebody's
+  terminal scrollback.
 - **Day-to-day management** afterwards: seats, quota, the tenant's own
   administrators, and whether its backup last verified.
 
