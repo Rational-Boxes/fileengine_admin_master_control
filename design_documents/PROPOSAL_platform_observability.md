@@ -245,6 +245,46 @@ converge.
 | Referrer concentration across links | One embedding site driving many links looks ordinary per link and is not. |
 | Open-mode links created, by tenant | `open` is the only mode a stranger can use; a tenant that has just started minting them is worth a look before the traffic arrives. |
 
+#### How much of this is actually in the stream
+
+Mostly, and the gap is specific enough to close deliberately.
+
+**What is there.** `MEDIA_SHARE.md` §12 emits `share_media_session` (one per
+viewing session), `share_media_claim`, `share_media_open_view`, and — the two
+that matter here — `share_media_throttled` and `share_media_parked`, the
+adjudicated rungs. Those are **already the platform-wide overload signal**: a
+rising rate of throttles across tenants is exactly the shape §4.4a describes,
+and it needs no new emission, only a rule with deployment audience and global
+scope. The `share_link_denied` / burst rules do the same for abuse.
+
+**What is not.** Bytes. Deliberately: §12 emits **one event per session and
+never per range request**, because a per-request event on a media door would
+flood a hash-chained log and cost more than the bytes it described. So the
+ledger can currently answer *how many sessions opened* and not *how much went
+out* — and egress is the number the bill is made of.
+
+**The fix is a field that is already required for something else.** §5 asks for
+`bytes` on the envelope so billing can meter egress from the ledger rather than
+from metrics (§7.1). Put it on the **session-completion** event — one per
+session, carrying that session's total — and the same field serves both: egress
+becomes durable, attributable and disputable, without a single extra event.
+
+That convergence is worth noticing rather than solving twice. It also settles
+the granularity question: per session is bounded by viewers, where per request
+is bounded by seeks, and a media player seeks a lot.
+
+**The division of labour that falls out:**
+
+| | Source | Property |
+|---|---|---|
+| **Shedding, in the moment** | `share_service`'s Redis rolling windows (§6.9) | fast, advisory, lost on restart — and that is fine, because it only decides whether to serve the next request |
+| **Detection across tenants, and billing** | the ledger's per-session events | durable, ordered, deduplicated, replayable |
+
+The one honest limit: a session for a long video stays open, so its bytes are
+known at close. Real-time shedding cannot wait for that and does not — it uses
+the windows. The ledger is for the questions asked afterwards, which is every
+question this tier asks.
+
 **And the levers, which stay within §4's boundary** — this application decides,
 something else acts:
 
