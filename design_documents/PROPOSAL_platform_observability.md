@@ -213,6 +213,56 @@ answers a question no single counter can.
 | Operation latency, p50/p95 | **Needs §5.** |
 | Auth failure rate for known principals | Distinct from §3.6's fan-out: this is *our users struggling*, not someone probing. |
 
+### 4.4a Media sharing overload — the first feature strangers can make expensive
+
+Media sharing is the first capability where an **unauthenticated third party**
+can drive platform cost. An open link embedded on a page that gets popular is
+indistinguishable, from the platform's side, from an attack — and both need the
+same response.
+
+`MEDIA_SHARE.md` §6.9 already meters and sheds load, with a four-rung ladder
+(observe → advise → throttle → park) and windows at three scopes: link, tenant,
+and service instance. **That is the right design and its highest scope is one
+tenant.** So the shape it cannot see is the one this tier exists for:
+
+> Thirty tenants each comfortably inside their own hourly budget, aggregating to
+> saturate the host, the link, or the month's egress bill.
+
+Each tenant looks healthy. No rung fires anywhere. It is the same blind spot as
+per-tenant security windows (`PROPOSAL_deployment_admin_signal.md` §3.5), and it
+has the same answer: the detection has to happen where every tenant's events
+converge.
+
+**What the administration interface needs to see:**
+
+| Metric | Note |
+|---|---|
+| Platform-wide media egress — rate and month-to-date | The bill. Aggregated across tenants, which nothing currently does. |
+| **Rate of change**, and a projection to the month's budget | The honest signal. By the time a total crosses a threshold the bytes are spent; a trajectory is actionable while it still is. |
+| Concurrent streams, platform-wide | Saturation arrives here before it arrives in any byte total. |
+| Cache fill rate | §6.9 names this as the metric that leads every other one, because a fill is a whole-file read from the core. It is also the one a per-tenant view under-weights. |
+| Rung distribution — how many links are at advise, throttle or parked | A rising count of throttled links is the platform absorbing something, quietly. |
+| Referrer concentration across links | One embedding site driving many links looks ordinary per link and is not. |
+| Open-mode links created, by tenant | `open` is the only mode a stranger can use; a tenant that has just started minting them is worth a look before the traffic arrives. |
+
+**And the levers, which stay within §4's boundary** — this application decides,
+something else acts:
+
+1. **Ask the tenant to publish elsewhere.** §6.9 already sends the creator that
+   advice with the numbers attached; at this tier it is a conversation with the
+   customer, which is the administration application's job rather than the
+   tenant's.
+2. **Park a link** — rung 3, requested here and applied by `share_service`.
+   Never revokes, for the same reason the ladder never does.
+3. **Suspend the tenant** — the blunt instrument, and it already exists
+   (`tenants.state`). It stops everything, not just media, which is why it is
+   last and why it is reversible.
+
+**The honest limit:** by the time the deployment tier sees an overload, the
+egress is spent. This tier's value is the trajectory and the conversation, not
+the interception — the interception is §6.9's, one scope down, and it should
+stay there.
+
 ### 4.5 Obligation and risk
 
 *Decision: what is outstanding, and what is exposed?*
@@ -272,7 +322,9 @@ One screen, no scrolling, roughly in this order:
 5. **Services** up / degraded / down, with the degraded reason.
 6. **Capacity headroom** — disk, and the shortest projected time-to-threshold
    across tenants.
-7. **Right now** — operations/sec, error rate, active tenants, active users.
+7. **Right now** — operations/sec, error rate, active tenants, active users,
+   and **concurrent media streams**, which saturates before any byte total
+   moves (§4.4a).
 
 ### 6.2 It must degrade honestly
 
