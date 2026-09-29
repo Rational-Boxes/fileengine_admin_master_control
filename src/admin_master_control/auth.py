@@ -356,6 +356,34 @@ def make_require(config: Config):
 # ── directory vs ledger ────────────────────────────────────────────────────
 
 
+class OwnerLookup(Protocol):
+    """A directory that can answer "does anyone own this deployment"."""
+
+    def holders(self, role: str) -> list[str]: ...
+
+
+def directory_has_owner(directory: DeploymentDirectory, candidates: Iterable[str]) -> bool:
+    """Whether any of ``candidates`` holds system_owner IN THE DIRECTORY.
+
+    THE DIRECTORY IS AUTHORITATIVE. Readiness must ask it, not the ledger: a
+    deployment can perfectly well have an owner in `ou=system` and an empty
+    ledger — that is what a directory-first deployment looks like on its first
+    start, and reporting it as "stranded" would be reporting the wrong store.
+
+    ``candidates`` is needed because LDAP answers "which groups is this user
+    in", not "who is in this group", through the interface this tier uses. The
+    names come from the ledger and the bootstrap value: the subjects this
+    application has any reason to know about. It is therefore a check for "an
+    owner we can name", not "an owner exists" — and the difference is why a
+    directory-only owner nobody has recorded still shows as drift rather than
+    being silently relied upon.
+    """
+    for subject in candidates:
+        if SYSTEM_OWNER in directory.roles_of(subject):
+            return True
+    return False
+
+
 def reconcile(directory_roles: dict[str, frozenset[str]],
               ledger_roles: dict[str, frozenset[str]]) -> list[str]:
     """Differences between what the directory says and what the ledger records.

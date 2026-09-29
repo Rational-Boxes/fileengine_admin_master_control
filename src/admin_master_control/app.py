@@ -32,7 +32,12 @@ from . import metrics as _fe_metrics
 from . import __version__
 from .administrators import AdministratorRegistry, bootstrap_owner, summarise
 from .api import build_router
-from .auth import DeploymentDirectory, LdapDeploymentDirectory, StaticDeploymentDirectory
+from .auth import (
+    DeploymentDirectory,
+    LdapDeploymentDirectory,
+    StaticDeploymentDirectory,
+    directory_has_owner,
+)
 from .config import Config, get_config
 from .roles import RoleError
 
@@ -111,10 +116,12 @@ def apply_bootstrap(config: Config, registry: AdministratorRegistry) -> list:
 
 
 def build_monitoring(config: Config,
-                     registry: AdministratorRegistry | None = None) -> FastAPI:
+                     registry: AdministratorRegistry | None = None,
+                     directory: DeploymentDirectory | None = None) -> FastAPI:
     """The unauthenticated monitoring listener. Loopback-only."""
     mon = FastAPI(title="admin_master_control monitoring", version=__version__)
     registry = registry if registry is not None else AdministratorRegistry()
+    directory = directory if directory is not None else default_directory(config)
 
     @mon.get("/healthz", include_in_schema=False)
     def healthz():
@@ -142,12 +149,19 @@ def build_monitoring(config: Config,
             problems.append(f"monitoring bound off-loopback ({config.monitor_host})")
         if not config.audit_url:
             problems.append("no audit ledger configured — nothing to display (§5.1)")
-        if not registry.holders("system_owner"):
-            # Not pedantry: system_owner is the only role that creates
-            # authority, so a deployment without one cannot grant anything to
-            # anybody. It is not degraded, it is stranded, and the only way out
-            # is provisioning.
-            problems.append("no system_owner — nobody can grant authority (§6.3)")
+        # THE DIRECTORY IS AUTHORITATIVE, so this asks it — not the ledger.
+        # A deployment can have an owner in ou=system and an empty ledger, which
+        # is what a directory-first deployment looks like on its first start;
+        # asking the ledger would report that as stranded and be wrong about
+        # which store decides.
+        known = set(registry.subjects())
+        if config.bootstrap_owner:
+            known.add(config.bootstrap_owner)
+        if not directory_has_owner(directory, known):
+            # system_owner is the only role that creates authority, so a
+            # deployment without one cannot grant anything to anybody. It is not
+            # degraded, it is stranded, and the only way out is the directory.
+            problems.append("no system_owner in the directory — nobody can grant authority (§6.3)")
 
         if problems:
             return JSONResponse({"status": "not-ready", "problems": problems}, status_code=503)
@@ -173,7 +187,7 @@ def main() -> None:  # pragma: no cover - process entrypoint
     for subject, roles in summarise(registry):
         log.info("administrator %s: %s", subject, ", ".join(roles))
 
-    mon = build_monitoring(config, registry)
+    mon = build_monitoring(config, registry, app.state.directory)
     t = threading.Thread(
         target=lambda: uvicorn.run(mon, host=config.monitor_host, port=config.monitor_port,
                                    log_level="warning"),

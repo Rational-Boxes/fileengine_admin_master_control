@@ -34,11 +34,17 @@ exists and is what :mod:`auth` resolves authority from.
 
 WHICH MEANS THERE ARE TWO STORES, AND THEY ARE NOT THE SAME THING.
 
-  * The DIRECTORY is what authorisation reads. A session's roles come from
-    `ou=system`, so adding a member there confers authority immediately, with
-    no entry here. That is correct: directory administration outranks this
-    application, and pretending otherwise would only mean this application
-    disagreed with the system that actually decides.
+  * The DIRECTORY IS AUTHORITATIVE — decided 2026-09-29. A session's roles come
+    from `ou=system`, adding a member there confers authority immediately with
+    no entry here, and readiness asks the directory whether anyone owns this
+    deployment. Directory administration outranks this application; pretending
+    otherwise would only mean this application disagreed with the system that
+    actually decides.
+
+    So nothing here is a permission check that the outside world must pass. The
+    ledger's own `can_grant` guard remains only for direct programmatic use —
+    the API passes the directory-verified roles instead (see `authority`
+    below).
   * This LEDGER is the attributed record of grants made THROUGH this
     application, and the seed for the first owner. It answers "who could have
     approved this, and since when" — which a directory, holding only the
