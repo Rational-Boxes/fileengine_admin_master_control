@@ -95,10 +95,47 @@ def test_problems_are_reported_together():
     assert r.status_code == 503 and len(r.json()["problems"]) >= 3
 
 
-def test_no_routes_are_mounted_yet():
-    # The application mounts nothing until a phase is built. Asserted so that a
-    # route arriving without its security review is a failing test rather than a
-    # quiet addition.
+def _served(app):
+    """(METHOD, path) for everything the app actually serves.
+
+    Read from the OpenAPI schema rather than walking ``app.routes``: this
+    FastAPI version keeps an included router as an opaque object rather than
+    flattening its routes, so walking the list finds nothing and the assertion
+    passes vacuously. The schema is what is served.
+    """
+    spec = app.openapi()
+    return {(m.upper(), path)
+            for path, ops in spec.get("paths", {}).items()
+            for m in ops}
+
+
+def test_only_phase_one_routes_are_mounted():
+    # This replaced "no routes are mounted yet", which was right while nothing
+    # was built and is the wrong assertion now that phase 1 is. The property
+    # worth keeping is the same one: a route arriving without its security
+    # review should be a FAILING TEST rather than a quiet addition.
+    #
+    # The list is exhaustive and must be edited deliberately. Phase 2-4 routes
+    # (queue, decisions, exclusions, decommissioning) appearing here without
+    # their review will fail this.
     from admin_master_control.app import build_app
-    paths = {r.path for r in build_app(_cfg()).routes}
-    assert not any(p.startswith("/v1") or p.startswith("/admin") for p in paths)
+    assert _served(build_app(_cfg(), _owned())) == {
+        ("POST", "/v1/auth/token"),
+        ("GET", "/v1/whoami"),
+        ("GET", "/v1/administrators"),
+        ("GET", "/v1/administrators/{subject}/history"),
+        ("GET", "/v1/roles"),
+        ("POST", "/v1/grants"),
+        ("POST", "/v1/revocations"),
+    }
+
+
+def test_phase_one_writes_nothing_outside_its_own_ledger():
+    # §8.1: "No writes, no decisions, no destructive capability." The two POSTs
+    # beyond the login touch this application's own grant ledger and nothing
+    # else. Anything reaching a tenant, a bucket or a playbook belongs to a
+    # later phase and a separate review.
+    from admin_master_control.app import build_app
+    writes = {path for method, path in _served(build_app(_cfg(), _owned()))
+              if method in {"POST", "PUT", "PATCH", "DELETE"}}
+    assert writes == {"/v1/auth/token", "/v1/grants", "/v1/revocations"}

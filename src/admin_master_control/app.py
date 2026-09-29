@@ -31,33 +31,56 @@ from fastapi.responses import JSONResponse
 from . import metrics as _fe_metrics
 from . import __version__
 from .administrators import AdministratorRegistry, bootstrap_owner, summarise
+from .api import build_router
+from .auth import DeploymentDirectory, LdapDeploymentDirectory, StaticDeploymentDirectory
 from .config import Config, get_config
 from .roles import RoleError
 
 log = logging.getLogger("admin_master_control.app")
 
 
+def default_directory(config: Config) -> DeploymentDirectory:
+    """LDAP when configured, an empty static directory otherwise.
+
+    The fallback authenticates NOBODY rather than everybody. A deployment with
+    no directory configured should refuse every login, not run open — and
+    /readyz says which piece is missing.
+    """
+    if config.ldap_url and config.ldap_base_dn:
+        return LdapDeploymentDirectory(url=config.ldap_url, base_dn=config.ldap_base_dn,
+                                       role_ou=config.ldap_role_ou,
+                                       user_ou=config.ldap_user_ou)
+    log.warning("no directory configured — every login will be refused")
+    return StaticDeploymentDirectory()
+
+
 def build_app(config: Config,
-              registry: AdministratorRegistry | None = None) -> FastAPI:
+              registry: AdministratorRegistry | None = None,
+              directory: DeploymentDirectory | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
-    ``registry`` is injectable for the same reason: the tests need to hand in a
-    ledger with a known history, and a startup that reaches for a global would
-    make that impossible without a database.
+    ``registry`` and ``directory`` are injectable for the same reason: the tests
+    need a ledger with a known history and a directory with known members, and a
+    startup that reaches for a global would make that impossible without LDAP
+    and a database.
     """
     app = FastAPI(title="FileEngine System Administration", version=__version__)
     app.state.config = config
     app.state.registry = registry if registry is not None else AdministratorRegistry()
+    app.state.directory = directory if directory is not None else default_directory(config)
     apply_bootstrap(config, app.state.registry)
 
-    # Routers land here as the phases in §8 of the proposal are built:
-    #   phase 1  observe      — read-only, cross-tenant
+    # PHASE 1 (§8.1): read-only, plus the door in front of it and the grant
+    # endpoints, which touch this application's own ledger and nothing else.
+    #
+    # The later phases land here as they are built:
     #   phase 2  queue        — acknowledgement
     #   phase 3  decisions    — redaction approval
     #   phase 4  exclusions   — the destructive tenant-admin tasks
-    # Nothing is mounted yet, deliberately: an application at this tier with no
-    # routes is safe, and one with speculative routes is not.
+    # They are absent rather than stubbed. A route that exists and returns 501
+    # is a route somebody will wire up.
+    app.include_router(build_router(config, app.state.registry, app.state.directory))
     return app
 
 

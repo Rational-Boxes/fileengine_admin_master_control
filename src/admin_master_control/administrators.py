@@ -26,15 +26,29 @@ That costs a little on read and buys the only thing that matters at this tier:
 the question "who could have approved this, and since when" has an answer that
 nobody had to remember to write down.
 
-WHERE ADMINISTRATORS LIVE, AND WHY NOT LDAP YET. §6.3 places these accounts
-outside every tenant OU, alongside ou=services, and that is the intended end
-state. It is blocked: §6.2 records that tenant-context role resolution walks a
-fallback search path that includes the directory root, so a `system_*` group
-placed in the directory today sits INSIDE the path a tenant login already walks,
-and whether it is reached is search ordering rather than a boundary. The
-resolver must refuse the namespace outright before such a group exists. Until
-then the ledger lives in this application's own store, which no tenant door
-reads, and :func:`holders` is the only authority.
+WHERE ADMINISTRATORS LIVE. §6.3 places these accounts outside every tenant OU,
+alongside ou=services. That was blocked until 2026-09-29 by the §6.2
+prerequisite — tenant-context role resolution walked a search path that
+included the directory root — and it is now done in both bridges, so `ou=system`
+exists and is what :mod:`auth` resolves authority from.
+
+WHICH MEANS THERE ARE TWO STORES, AND THEY ARE NOT THE SAME THING.
+
+  * The DIRECTORY is what authorisation reads. A session's roles come from
+    `ou=system`, so adding a member there confers authority immediately, with
+    no entry here. That is correct: directory administration outranks this
+    application, and pretending otherwise would only mean this application
+    disagreed with the system that actually decides.
+  * This LEDGER is the attributed record of grants made THROUGH this
+    application, and the seed for the first owner. It answers "who could have
+    approved this, and since when" — which a directory, holding only the
+    present, cannot.
+
+They can legitimately disagree, and the disagreement must never be silent:
+:func:`auth.reconcile` names it and `/v1/administrators` returns it beside the
+list, because a role held in the directory with no grant behind it is authority
+nobody can account for — and is exactly what someone with directory access
+would create.
 """
 from __future__ import annotations
 
@@ -148,7 +162,8 @@ class AdministratorRegistry:
 
     # ── writing ────────────────────────────────────────────────────────────
 
-    def grant(self, subject: str, role: str, *, by: str, reason: str = "") -> Grant:
+    def grant(self, subject: str, role: str, *, by: str, reason: str = "",
+              authority: Optional[Iterable[str]] = None) -> Grant:
         """Grant ``role`` to ``subject``, as ``by``.
 
         Refuses unless the actor holds `system_owner` (§6.1: "the only role that
@@ -160,9 +175,23 @@ class AdministratorRegistry:
         that. It is not a loophole: an owner can already grant the same role to
         anyone, so forbidding the self case would buy nothing and would only
         push the same act through a second account.
+
+        ``authority`` NAMES WHERE THE ACTOR'S ROLES CAME FROM, and exists
+        because there are two stores. The API gate authorises from the
+        DIRECTORY — that is what the session's roles are resolved from — while
+        this ledger knows only about grants recorded here. The two can
+        legitimately disagree: an owner added in the directory has authority
+        before any grant of theirs is recorded, which is exactly the bootstrap
+        case. Passing the directory-verified roles keeps one source of truth per
+        call instead of silently checking a second one and refusing for a reason
+        the caller cannot see.
+
+        Omitted, it falls back to this ledger's own view, which keeps the
+        control meaningful for direct programmatic use and for the tests.
         """
         validate_role(role)
-        if by != PROVISIONING and not can_grant(self.roles_of(by)):
+        actor_roles = self.roles_of(by) if authority is None else frozenset(authority)
+        if by != PROVISIONING and not can_grant(actor_roles):
             raise RoleError(
                 f"{by!r} cannot grant {role!r}: only {SYSTEM_OWNER} creates authority"
             )
@@ -177,7 +206,8 @@ class AdministratorRegistry:
         self.store.append(g)
         return g
 
-    def revoke(self, subject: str, role: str, *, by: str, reason: str = "") -> Grant:
+    def revoke(self, subject: str, role: str, *, by: str, reason: str = "",
+               authority: Optional[Iterable[str]] = None) -> Grant:
         """Revoke ``role`` from ``subject``. Appends; never edits.
 
         The last owner cannot be revoked. A deployment with no owner has no way
@@ -185,7 +215,8 @@ class AdministratorRegistry:
         during an incident is the wrong time.
         """
         validate_role(role)
-        if not can_grant(self.roles_of(by)):
+        actor_roles = self.roles_of(by) if authority is None else frozenset(authority)
+        if not can_grant(actor_roles):
             raise RoleError(f"{by!r} cannot revoke {role!r}: only {SYSTEM_OWNER} creates authority")
         if role == SYSTEM_OWNER and self.holders(SYSTEM_OWNER) == [subject]:
             raise RoleError(

@@ -75,6 +75,13 @@ class Config:
     # makes "refuse these in tenant context" one rule rather than a list that
     # drifts as roles are added — see DEPLOYMENT_MANAGEMENT_INTERFACE.md §6.2.
     role_prefix: str = field(default_factory=lambda: _env("AMC_ROLE_PREFIX", "system_"))
+    # The OU holding the deployment role groups, and the one holding accounts.
+    # Configurable because directory layout is a deployment's choice — but the
+    # role OU must never be a tenant OU or the directory root: this tier reads
+    # authority from it, and widening it is the mirror of the defect the tenant
+    # doors were just fixed for.
+    ldap_role_ou: str = field(default_factory=lambda: _env("AMC_LDAP_ROLE_OU", "ou=system"))
+    ldap_user_ou: str = field(default_factory=lambda: _env("AMC_LDAP_USER_OU", "ou=users"))
     # A DISTINCT audience from every tenant door, so a tenant token cannot be
     # accepted here and one minted here cannot be accepted there. Structural,
     # not a check someone remembered to write.
