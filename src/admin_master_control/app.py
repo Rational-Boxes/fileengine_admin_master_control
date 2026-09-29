@@ -30,16 +30,26 @@ from fastapi.responses import JSONResponse
 
 from . import metrics as _fe_metrics
 from . import __version__
+from .administrators import AdministratorRegistry, bootstrap_owner, summarise
 from .config import Config, get_config
+from .roles import RoleError
 
 log = logging.getLogger("admin_master_control.app")
 
 
-def build_app(config: Config) -> FastAPI:
+def build_app(config: Config,
+              registry: AdministratorRegistry | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
-    so a test can construct one without a deployment underneath it."""
+    so a test can construct one without a deployment underneath it.
+
+    ``registry`` is injectable for the same reason: the tests need to hand in a
+    ledger with a known history, and a startup that reaches for a global would
+    make that impossible without a database.
+    """
     app = FastAPI(title="FileEngine System Administration", version=__version__)
     app.state.config = config
+    app.state.registry = registry if registry is not None else AdministratorRegistry()
+    apply_bootstrap(config, app.state.registry)
 
     # Routers land here as the phases in §8 of the proposal are built:
     #   phase 1  observe      — read-only, cross-tenant
@@ -51,9 +61,37 @@ def build_app(config: Config) -> FastAPI:
     return app
 
 
-def build_monitoring(config: Config) -> FastAPI:
+def apply_bootstrap(config: Config, registry: AdministratorRegistry) -> list:
+    """Apply ``AMC_BOOTSTRAP_OWNER``, if set, and say what it did.
+
+    Idempotent, because it runs on every start. A refusal is LOGGED rather than
+    raised: the deployment already has an owner and is therefore working, and
+    taking the console down because a stale configuration value names somebody
+    else would be an outage caused by a file nobody has read in a year. /readyz
+    is where a deployment with NO owner gets reported, and that is the condition
+    that actually needs attention.
+    """
+    if not config.bootstrap_owner:
+        return []
+    try:
+        made = bootstrap_owner(
+            registry,
+            config.bootstrap_owner,
+            with_all_roles=config.bootstrap_owner_all_roles,
+        )
+    except RoleError as e:
+        log.warning("bootstrap owner not applied: %s", e)
+        return []
+    for g in made:
+        log.info("granted %s to %s (by %s)", g.role, g.subject, g.granted_by)
+    return made
+
+
+def build_monitoring(config: Config,
+                     registry: AdministratorRegistry | None = None) -> FastAPI:
     """The unauthenticated monitoring listener. Loopback-only."""
     mon = FastAPI(title="admin_master_control monitoring", version=__version__)
+    registry = registry if registry is not None else AdministratorRegistry()
 
     @mon.get("/healthz", include_in_schema=False)
     def healthz():
@@ -81,6 +119,12 @@ def build_monitoring(config: Config) -> FastAPI:
             problems.append(f"monitoring bound off-loopback ({config.monitor_host})")
         if not config.audit_url:
             problems.append("no audit ledger configured — nothing to display (§5.1)")
+        if not registry.holders("system_owner"):
+            # Not pedantry: system_owner is the only role that creates
+            # authority, so a deployment without one cannot grant anything to
+            # anybody. It is not degraded, it is stranded, and the only way out
+            # is provisioning.
+            problems.append("no system_owner — nobody can grant authority (§6.3)")
 
         if problems:
             return JSONResponse({"status": "not-ready", "problems": problems}, status_code=503)
@@ -101,7 +145,12 @@ def main() -> None:  # pragma: no cover - process entrypoint
     logging.basicConfig(level=logging.INFO)
     config = get_config()
 
-    mon = build_monitoring(config)
+    registry = AdministratorRegistry()
+    app = build_app(config, registry)
+    for subject, roles in summarise(registry):
+        log.info("administrator %s: %s", subject, ", ".join(roles))
+
+    mon = build_monitoring(config, registry)
     t = threading.Thread(
         target=lambda: uvicorn.run(mon, host=config.monitor_host, port=config.monitor_port,
                                    log_level="warning"),
@@ -109,4 +158,4 @@ def main() -> None:  # pragma: no cover - process entrypoint
     t.start()
     log.info("monitoring on %s:%d", config.monitor_host, config.monitor_port)
 
-    uvicorn.run(build_app(config), host=config.host, port=config.port)
+    uvicorn.run(app, host=config.host, port=config.port)

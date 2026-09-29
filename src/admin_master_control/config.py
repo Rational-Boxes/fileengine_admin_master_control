@@ -85,6 +85,22 @@ class Config:
     # without the fact being visible.
     require_mfa: bool = field(default_factory=lambda: _bool("AMC_REQUIRE_MFA", True))
 
+    # ── The first administrator (§6.3) ─────────────────────────────────────
+    # The first system_owner comes from provisioning, the way a tenant's first
+    # administrator does in tenant.yml. Empty means "no owner yet", which
+    # /readyz reports: a deployment-tier console with nobody able to grant
+    # authority is not ready, it is stranded.
+    #
+    # It is applied ONCE. If someone else already holds system_owner, startup
+    # refuses rather than adding a second — otherwise this value is a back door
+    # that only needs edit access to a file.
+    bootstrap_owner: str = field(default_factory=lambda: _env("AMC_BOOTSTRAP_OWNER", ""))
+    # Whether that first owner also receives the four operational roles.
+    # system_owner does NOT imply them (§6.1), so without this the first
+    # administrator can grant every power and exercise none.
+    bootstrap_owner_all_roles: bool = field(
+        default_factory=lambda: _bool("AMC_BOOTSTRAP_OWNER_ALL_ROLES", True))
+
     def monitoring_is_public(self) -> bool:
         """True when the monitoring listener is bound off-loopback — which the
         platform's convention forbids. /readyz reports it rather than refusing:
