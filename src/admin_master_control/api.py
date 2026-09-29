@@ -47,11 +47,18 @@ from .auth import (
     reconcile,
 )
 from .config import Config
+from .incidents import (
+    IncidentSource,
+    LedgerUnavailable,
+    aggregated,
+    campaigns,
+)
 from .roles import (
     ALL_ROLES,
     GRANTABLE_ROLES,
     SYSTEM_OBSERVER,
     SYSTEM_OWNER,
+    SYSTEM_SECURITY,
     RoleError,
 )
 
@@ -71,7 +78,8 @@ class GrantRequest(BaseModel):
 
 
 def build_router(config: Config, registry: AdministratorRegistry,
-                 directory: DeploymentDirectory) -> APIRouter:
+                 directory: DeploymentDirectory,
+                 incidents: IncidentSource | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
 
@@ -214,5 +222,52 @@ def build_router(config: Config, registry: AdministratorRegistry,
         log.info("revoke %s from %s by %s (as %s)", g.role, g.subject, g.granted_by, authorised_as)
         return {"subject": g.subject, "role": g.role, "revoked_by": g.granted_by,
                 "authorised_as": authorised_as, "at": g.at.isoformat()}
+
+    # ── the cross-tenant security view (§3.4) ──────────────────────────────
+    #
+    # Gated on system_security rather than system_observer. §6.1 gives
+    # system_security "incidents, cross-tenant detection, acknowledgements" as
+    # its own area, and an incident naming a source address and the tenants it
+    # touched is more than a read-only baseline should see.
+
+    def _ledger():
+        if incidents is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="no audit ledger configured")
+        return incidents
+
+    @r.get("/security/incidents")
+    def security_incidents(limit: int = 100, min_severity: str | None = None,
+                           status_filter: str | None = None,
+                           principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """Every incident from every tenant, severity-ranked (§3.4 aggregation)."""
+        try:
+            return aggregated(_ledger(), limit=max(1, min(limit, 500)),
+                              min_severity=min_severity, status=status_filter)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        except LedgerUnavailable as e:
+            # 503, never an empty list. "No incidents" and "I could not ask" look
+            # identical in a console and mean opposite things, and an empty
+            # security view is the most reassuring thing a screen can show.
+            log.error("security view unavailable: %s", e)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
+
+    @r.get("/security/campaigns")
+    def security_campaigns(limit: int = 100,
+                           principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """The cross-tenant detections — what no tenant could have seen (§3.4).
+
+        These are the `scope=global` incidents: produced by windows that dropped
+        the tenant, so each is a count no single tenant's view contains. This is
+        the only view in which the campaign exists at all.
+        """
+        try:
+            return campaigns(_ledger(), limit=max(1, min(limit, 500)))
+        except LedgerUnavailable as e:
+            log.error("campaign view unavailable: %s", e)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
 
     return r

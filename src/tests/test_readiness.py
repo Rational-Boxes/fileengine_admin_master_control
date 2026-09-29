@@ -147,6 +147,10 @@ def test_only_phase_one_routes_are_mounted():
         ("GET", "/v1/roles"),
         ("POST", "/v1/grants"),
         ("POST", "/v1/revocations"),
+        # §3.4, the cross-tenant security view. Read-only, gated on
+        # system_security rather than the observer baseline.
+        ("GET", "/v1/security/incidents"),
+        ("GET", "/v1/security/campaigns"),
     }
 
 

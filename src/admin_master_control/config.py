@@ -62,6 +62,11 @@ class Config:
 
     # ── What it reads, through APIs rather than through schemas (§5.1) ─────
     audit_url: str = field(default_factory=lambda: _env("AMC_AUDIT_URL", ""))
+    # The credential this application reads the ledger with. NOT a system_admin
+    # token: that role is the core's ACL bypass and reads every file in every
+    # tenant. audit_service grants the global audit read to the deployment roles
+    # instead (AUDIT_DEPLOYMENT_READ_ROLES).
+    audit_token: str = field(default_factory=lambda: _env("AMC_AUDIT_TOKEN", ""))
     ldap_manager_url: str = field(default_factory=lambda: _env("AMC_LDAP_MANAGER_URL", ""))
     # The audit stream, for LATENCY only. The ledger is what is displayed: the
     # stream is XADDed with MAXLEN ~ and forgets, so a console built on it would
