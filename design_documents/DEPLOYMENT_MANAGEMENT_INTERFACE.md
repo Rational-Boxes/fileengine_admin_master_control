@@ -230,26 +230,65 @@ with unclear standing.
 The first is not currently safe by construction, and this must be fixed before
 any such group exists.
 
-`LDAPAuthenticator::extractRolesFromGroups`
-(`http_bridge/src/ldap_authenticator.cpp:~700`) resolves a user's groups by
-trying a **list of fallback search bases in order**, and that list includes the
-directory root (`ldap_domain_`) along with `ou=groups`, `ou=Group`, `ou=Roles`,
-`ou=role`, `ou=tenants` and `ou=users` beneath it. It breaks at the first base
-that returns successfully.
+**RESOLVED 2026-09-29** — `fix/tenant-roles-scoped-to-tenant-ous` in both
+bridges. The description below is kept because it is what the work was scoped
+against, with one correction: **it was worse than stated.**
 
-So a group placed outside tenant scope — which is exactly what this decision
-calls for — sits **inside the search path a tenant login already walks**.
-Whether it is reached depends on whether an earlier, tenant-scoped base returned
-first. That is search ordering, not a boundary, and it is the same shape as the
-defect fixed in 1.9.17, where a flattened role search let a member of one tenant
-administer another. Reintroducing it through directory *layout* rather than
-through code would be no better.
+`LDAPAuthenticator::extractRolesFromGroups`
+(`http_bridge/src/ldap_authenticator.cpp:~700`) resolved a user's groups by
+trying a **list of fallback search bases**, and that list included the directory
+root (`ldap_domain_`) along with `ou=groups`, `ou=Group`, `ou=Roles`, `ou=role`,
+`ou=tenants` and `ou=users` beneath it.
+
+This section said it "breaks at the first base that returns successfully", which
+would make the outcome depend on search ordering. Reading the loop, it did not
+break — the comment in the code says *"Continue to other bases to collect all
+possible roles"* and it did exactly that, **unioning every base**. So the
+directory root was not *sometimes* reached depending on ordering; it was
+**always** reached. Every `groupOfNames` anywhere in the directory naming the
+user became a role of theirs in tenant context.
+
+Two further findings from the same reading, neither of which was known when this
+was written:
+
+- `tenant_base_` **defaulted to the directory root** when unset
+  (`tenant_base.empty() ? ldap_domain : tenant_base`), so a deployment that
+  simply did not configure it searched the whole directory without anyone
+  choosing that. Production does set it; the default was a trap waiting for the
+  next deployment.
+- The empty-roles fallback searched a hard-coded `ou=default,ou=tenants,…`
+  regardless of who was logging in, so a user in another tenant with no roles of
+  their own fell back into `default`'s groups.
+
+It is the same shape as the defect fixed in 1.9.17, where a flattened role search
+let a member of one tenant administer another. Reintroducing it through directory
+*layout* rather than through code would be no better.
+
+**What was done.** Tenant-context role collection now searches exactly one base
+— the tenant subtree — and `SUBTREE` scope covers every `ou=<tenant>` beneath
+it, which is what the widening list was reaching for by accident. An unset base,
+or one equal to the directory root, is **refused** rather than widened. The
+policy lives in `http_bridge/include/tenant_role_policy.h` (shared verbatim with
+`webdav_bridge`) so it is header-only and testable offline: it could not be
+asserted on before, because it lived inside a function that needs a live LDAP
+connection to call. 14 tests pin it.
 
 **Therefore, before a deployment role is defined:** tenant-context role
 resolution must refuse names in the deployment namespace outright, regardless of
 which base returned them. A shared prefix (`system_*`) makes that one rule rather
 than a list that drifts as roles are added — which is the practical argument for
 the namespace, beyond tidiness.
+
+**Done, and kept as a SECOND layer rather than a replacement for the scoping.**
+Both are needed: scoping the search depends on directory *layout*, and layout is
+configuration. A `system_*` group moved into a tenant OU by mistake, or a tenant
+OU created above one, puts it back inside a base the bridge is entitled to
+search — and the name filter is what catches it then. Every exit from
+`extractRolesFromGroups` passes through the filter, including the DN-parsing
+fallbacks; it was made a single choke point rather than a guard repeated at each
+acceptance site, because there were already two identical sites and a third
+would have been missed. The prefix match agrees with
+`admin_master_control/src/admin_master_control/roles.py`, deliberately.
 
 ### 6.3 Where the first one comes from
 
