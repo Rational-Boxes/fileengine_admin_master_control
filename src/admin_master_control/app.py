@@ -33,6 +33,7 @@ from . import __version__
 from .administrators import AdministratorRegistry, bootstrap_owner, summarise
 from .api import build_router
 from .incidents import IncidentSource, from_config as incidents_from_config
+from .redactions import ErasureSource, StaticErasures
 from .auth import (
     DeploymentDirectory,
     LdapDeploymentDirectory,
@@ -63,7 +64,8 @@ def default_directory(config: Config) -> DeploymentDirectory:
 def build_app(config: Config,
               registry: AdministratorRegistry | None = None,
               directory: DeploymentDirectory | None = None,
-              incidents: IncidentSource | None = None) -> FastAPI:
+              incidents: IncidentSource | None = None,
+              erasures: ErasureSource | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
@@ -77,6 +79,12 @@ def build_app(config: Config,
     app.state.registry = registry if registry is not None else AdministratorRegistry()
     app.state.directory = directory if directory is not None else default_directory(config)
     app.state.incidents = incidents if incidents is not None else incidents_from_config(config)
+    # No live erasure source exists yet — §3.3.1's fields come from the core's
+    # `erasure` table plus LDAP, and neither read is built. An EMPTY source, not
+    # None: the route then reports an empty register rather than 503, which is
+    # honest (there are no items it can see) where a 503 would say the feature is
+    # broken.
+    app.state.erasures = erasures if erasures is not None else StaticErasures()
     apply_bootstrap(config, app.state.registry)
 
     # PHASE 1 (§8.1): read-only, plus the door in front of it and the grant
@@ -89,7 +97,7 @@ def build_app(config: Config,
     # They are absent rather than stubbed. A route that exists and returns 501
     # is a route somebody will wire up.
     app.include_router(build_router(config, app.state.registry, app.state.directory,
-                                    app.state.incidents))
+                                    app.state.incidents, app.state.erasures))
     return app
 
 

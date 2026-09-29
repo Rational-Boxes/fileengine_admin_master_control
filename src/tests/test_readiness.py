@@ -157,6 +157,8 @@ def test_only_phase_one_routes_are_mounted():
         ("GET", "/v1/security/backlog"),
         ("GET", "/v1/security/queue/{incident_id}"),
         ("POST", "/v1/security/queue/transition"),
+        # §3.3.2, the redaction register. Read-only, and names the file by uuid.
+        ("GET", "/v1/redactions"),
     }
 
 

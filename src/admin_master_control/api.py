@@ -47,6 +47,7 @@ from .auth import (
     reconcile,
 )
 from .config import Config
+from .redactions import ErasureSource, register as redaction_register
 from .incidents import (
     IncidentSource,
     LedgerUnavailable,
@@ -96,7 +97,8 @@ class TransitionRequest(BaseModel):
 
 def build_router(config: Config, registry: AdministratorRegistry,
                  directory: DeploymentDirectory,
-                 incidents: IncidentSource | None = None) -> APIRouter:
+                 incidents: IncidentSource | None = None,
+                 erasures: ErasureSource | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
 
@@ -361,5 +363,44 @@ def build_router(config: Config, registry: AdministratorRegistry,
         log.info("incident %s -> %s by %s (as %s)", body.incident_id, body.state,
                  principal.subject, authorised_as)
         return {**out, "actor": principal.subject, "authorised_as": authorised_as}
+
+    # ── the redaction register (§3.3.2) ────────────────────────────────────
+
+    @r.get("/redactions")
+    def redactions(principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """Every redaction, its state, and how long it has been in it.
+
+        THE FILE IS NAMED BY UUID AND NOTHING ELSE unless its name survived the
+        erasure. The redaction concern is potential PII in CONTENT — a filename
+        is content ("Acme_Corp_Contract_J_Smith.pdf") — while the principals who
+        acted are kept, because "who" was never the concern and an erasure with
+        no attributable actor is unauditable.
+
+        Where a name was redacted there is no second copy anywhere, and this
+        surface does not go looking for one: it shows the absence. §3.3.1 — "A
+        reporting surface that quietly made redacted names visible again to the
+        tier with the most reach would be the worst possible place for that leak."
+        """
+        if erasures is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="no erasure source configured")
+        states: dict = {}
+        if incidents is not None:
+            # States come from the acknowledgement queue, keyed by erasure_id.
+            try:
+                for item in (incidents.queue(limit=500).get("items") or []):
+                    key = item.get("group_key")
+                    if key:
+                        states[key] = {"state": item.get("state"),
+                                       "evidence": item.get("evidence") or "",
+                                       "reason": item.get("reason") or ""}
+            except LedgerUnavailable as e:
+                # The register is still worth showing without states — it is the
+                # evidence of an obligation — but it must say the states are
+                # missing rather than implying everything is unlooked-at.
+                log.error("redaction states unavailable: %s", e)
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                    detail="queue state unavailable") from e
+        return redaction_register(erasures, states)
 
     return r
