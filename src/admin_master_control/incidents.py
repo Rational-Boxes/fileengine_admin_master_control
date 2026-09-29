@@ -60,6 +60,22 @@ class LedgerUnavailable(Exception):
     """
 
 
+class TransitionRefused(Exception):
+    """The procedure does not allow that move.
+
+    Distinct from :class:`LedgerUnavailable` on purpose: "you cannot approve
+    something nobody acknowledged" is a correct answer, and presenting it as an
+    outage would teach an administrator to retry rather than to read it.
+    """
+
+
+def _detail(r) -> str:
+    try:
+        return str(r.json().get("detail") or r.text)
+    except Exception:  # noqa: BLE001
+        return r.text[:200]
+
+
 class IncidentSource(Protocol):
     def fetch(self, **filters) -> list[dict]: ...
 
@@ -72,26 +88,50 @@ class AuditServiceIncidents:
     token: str = ""
     timeout_s: float = 10.0
 
-    def fetch(self, **filters) -> list[dict]:
+    def _call(self, method: str, path: str, *, params=None, json=None) -> dict:
         import httpx
 
-        params = {k: v for k, v in filters.items() if v is not None}
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        url = self.base_url.rstrip("/") + "/v1/security/incidents"
+        url = self.base_url.rstrip("/") + path
         try:
-            r = httpx.get(url, params=params, headers=headers, timeout=self.timeout_s)
+            r = httpx.request(method, url, params=params, json=json, headers=headers,
+                              timeout=self.timeout_s)
         except Exception as e:  # noqa: BLE001
             raise LedgerUnavailable(f"audit ledger unreachable: {e}") from e
         if r.status_code == 403:
             raise LedgerUnavailable(
                 "audit ledger refused this credential — the deployment read role "
                 "must be granted in audit_service (AUDIT_DEPLOYMENT_READ_ROLES)")
+        if r.status_code == 409:
+            # The procedure refused the move. Surfaced as its own type so the
+            # route can answer 409 rather than flattening it into "unavailable",
+            # which would read as an outage instead of "you cannot do that yet".
+            raise TransitionRefused(_detail(r))
         if r.status_code >= 400:
-            raise LedgerUnavailable(f"audit ledger returned {r.status_code}")
+            raise LedgerUnavailable(f"audit ledger returned {r.status_code}: {_detail(r)}")
         try:
-            return list(r.json().get("incidents") or [])
+            return dict(r.json())
         except Exception as e:  # noqa: BLE001
             raise LedgerUnavailable(f"audit ledger returned unreadable JSON: {e}") from e
+
+    def fetch(self, **filters) -> list[dict]:
+        params = {k: v for k, v in filters.items() if v is not None}
+        return list(self._call("GET", "/v1/security/incidents",
+                               params=params).get("incidents") or [])
+
+    def queue(self, **filters) -> dict:
+        params = {k: v for k, v in filters.items() if v is not None}
+        return self._call("GET", "/v1/security/queue", params=params)
+
+    def backlog(self, **filters) -> dict:
+        params = {k: v for k, v in filters.items() if v is not None}
+        return self._call("GET", "/v1/security/queue/backlog", params=params)
+
+    def item_history(self, incident_id: int) -> dict:
+        return self._call("GET", f"/v1/security/incidents/{incident_id}/history")
+
+    def transition(self, **body) -> dict:
+        return self._call("POST", "/v1/security/queue/transition", json=body)
 
 
 @dataclass
@@ -118,6 +158,81 @@ class StaticIncidents:
                                     _neg_ts(r.get("ts"))))
         limit = filters.get("limit")
         return out[: int(limit)] if limit else out
+
+
+@dataclass
+class StaticQueue(StaticIncidents):
+    """StaticIncidents plus the queue, for testing the console without
+    audit_service. Holds the same append-only discipline so the tests exercise
+    the procedure rather than a permissive double."""
+
+    transitions: dict = field(default_factory=dict)   # incident_id -> [entries]
+
+    #: Mirrors audit_service.queue.TRANSITIONS. Duplicated in a DOUBLE rather
+    #: than imported, deliberately: importing it would make these tests pass
+    #: whatever audit_service allowed, including a future widening nobody
+    #: reviewed. A test pins the two together instead.
+    MOVES = {
+        "raised": ("acknowledged",),
+        "acknowledged": ("customer_confirmed", "declined"),
+        "customer_confirmed": ("approved", "declined"),
+        "approved": ("completed",),
+        "declined": (),
+        "completed": (),
+    }
+    OPEN = ("raised", "acknowledged", "customer_confirmed", "approved")
+
+    def state_of(self, incident_id: int) -> str:
+        entries = self.transitions.get(incident_id) or []
+        return entries[-1]["state"] if entries else "raised"
+
+    def queue(self, **filters) -> dict:
+        want = filters.get("state")
+        out = []
+        for r in self.rows:
+            if r.get("audience") != filters.get("audience", "deployment"):
+                continue
+            st = self.state_of(r["id"])
+            if want is not None and st != want:
+                continue
+            out.append({**r, "state": st, "next_states": list(self.MOVES.get(st, ()))})
+        return {"items": out, "states": list(self.MOVES)}
+
+    def backlog(self, **filters) -> dict:
+        counts = {s: 0 for s in self.MOVES}
+        for r in self.rows:
+            if r.get("audience") != filters.get("audience", "deployment"):
+                continue
+            counts[self.state_of(r["id"])] += 1
+        return {"counts": counts,
+                "unacknowledged": counts["raised"],
+                "needs_a_human": sum(counts[s] for s in self.OPEN),
+                "open": sum(counts[s] for s in self.OPEN)}
+
+    def item_history(self, incident_id: int) -> dict:
+        return {"incident_id": incident_id, "state": self.state_of(incident_id),
+                "history": list(self.transitions.get(incident_id) or [])}
+
+    def transition(self, **body) -> dict:
+        iid = int(body["incident_id"])
+        to = str(body.get("state") or "")
+        frm = self.state_of(iid)
+        if to not in self.MOVES:
+            raise TransitionRefused(f"unknown state: {to!r}")
+        if to not in self.MOVES.get(frm, ()):
+            raise TransitionRefused(f"cannot go {frm} -> {to}")
+        if to == "customer_confirmed" and not body.get("counterparty"):
+            raise TransitionRefused("customer_confirmed needs the counterparty")
+        if to == "declined" and not body.get("reason"):
+            raise TransitionRefused("a decline needs a reason")
+        if to == "completed" and not body.get("evidence"):
+            raise TransitionRefused("completed needs a pointer to the evidence")
+        entry = {"state": to, "actor": body.get("actor", ""),
+                 "reason": body.get("reason", ""),
+                 "counterparty": body.get("counterparty", ""),
+                 "evidence": body.get("evidence", "")}
+        self.transitions.setdefault(iid, []).append(entry)
+        return {"incident_id": iid, "from_state": frm, "state": to}
 
 
 def _neg_ts(ts) -> str:

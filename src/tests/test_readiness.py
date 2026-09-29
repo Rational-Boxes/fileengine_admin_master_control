@@ -151,6 +151,12 @@ def test_only_phase_one_routes_are_mounted():
         # system_security rather than the observer baseline.
         ("GET", "/v1/security/incidents"),
         ("GET", "/v1/security/campaigns"),
+        # §3.2 / §4, the queue of things waiting on a human. The transition POST
+        # writes to audit_service's queue and executes nothing.
+        ("GET", "/v1/security/queue"),
+        ("GET", "/v1/security/backlog"),
+        ("GET", "/v1/security/queue/{incident_id}"),
+        ("POST", "/v1/security/queue/transition"),
     }
 
 
@@ -162,4 +168,8 @@ def test_phase_one_writes_nothing_outside_its_own_ledger():
     from admin_master_control.app import build_app
     writes = {path for method, path in _served(build_app(_cfg(), _owned()))
               if method in {"POST", "PUT", "PATCH", "DELETE"}}
-    assert writes == {"/v1/auth/token", "/v1/grants", "/v1/revocations"}
+    assert writes == {"/v1/auth/token", "/v1/grants", "/v1/revocations",
+                      # Writes a DECISION to audit_service's queue. It executes
+                      # nothing: an approved redaction is carried out by the
+                      # cloud-B application, behind its own human step.
+                      "/v1/security/queue/transition"}

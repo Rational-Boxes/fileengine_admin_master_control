@@ -50,6 +50,7 @@ from .config import Config
 from .incidents import (
     IncidentSource,
     LedgerUnavailable,
+    TransitionRefused,
     aggregated,
     campaigns,
 )
@@ -75,6 +76,22 @@ class GrantRequest(BaseModel):
     subject: str
     role: str
     reason: str = ""
+
+
+class TransitionRequest(BaseModel):
+    """One move along the procedure.
+
+    There is no `actor` field, deliberately. The acting administrator is the
+    authenticated caller; accepting one from the body would record who the caller
+    SAID they were, and this is the table that exists to answer "who approved
+    this".
+    """
+
+    incident_id: int
+    state: str
+    reason: str = ""
+    counterparty: str = ""
+    evidence: str = ""
 
 
 def build_router(config: Config, registry: AdministratorRegistry,
@@ -269,5 +286,80 @@ def build_router(config: Config, registry: AdministratorRegistry,
             log.error("campaign view unavailable: %s", e)
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail="audit ledger unavailable") from e
+
+    # ── the queue of things waiting on a human (§3.2 / §4) ─────────────────
+
+    @r.get("/security/queue")
+    def security_queue(state: str | None = None, limit: int = 100,
+                       principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """Items waiting, with their state and the legal next moves.
+
+        Returning `next_states` per item is what keeps a console from
+        hard-coding the procedure and drifting from it.
+        """
+        try:
+            return _ledger().queue(state=state, limit=max(1, min(limit, 500)))
+        except LedgerUnavailable as e:
+            log.error("queue unavailable: %s", e)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
+
+    @r.get("/security/backlog")
+    def security_backlog(older_than_hours: float = 0.0,
+                         principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """How much is waiting, and for how long.
+
+        §4: "A queue whose backlog is invisible is a log." `unacknowledged` with
+        `older_than_hours` set is the one number worth alerting on, and the one
+        that cannot be satisfied by sending more email.
+        """
+        try:
+            return _ledger().backlog(older_than_hours=older_than_hours)
+        except LedgerUnavailable as e:
+            log.error("backlog unavailable: %s", e)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
+
+    @r.get("/security/queue/{incident_id}")
+    def security_item(incident_id: int,
+                      principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """One item's full transition history, refusals included."""
+        try:
+            return _ledger().item_history(incident_id)
+        except LedgerUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
+
+    @r.post("/security/queue/transition", status_code=status.HTTP_201_CREATED)
+    def security_transition(body: TransitionRequest,
+                            principal: Principal = Depends(require(SYSTEM_SECURITY))):
+        """Move one item along.
+
+        THIS APPLICATION PRODUCES AN APPROVED REQUEST; IT DOES NOT EXECUTE ONE
+        (§3.3, §4 of the proposal's "what it must never do"). Approving a
+        redaction records a decision — the cloud-B application carries it out,
+        behind its own human step. That separation is the entire security
+        argument of the redaction design and is not collapsed here.
+
+        The actor is the authenticated caller, and the authorising role is
+        recorded from the gate that allowed the call.
+        """
+        authorised_as = principal.authorising(SYSTEM_SECURITY)
+        try:
+            out = _ledger().transition(
+                incident_id=body.incident_id, state=body.state, actor=principal.subject,
+                reason=body.reason, counterparty=body.counterparty, evidence=body.evidence)
+        except TransitionRefused as e:
+            # 409, not 503: "you cannot approve something nobody acknowledged" is
+            # a correct answer, and presenting it as an outage would teach an
+            # administrator to retry rather than to read it.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+        except LedgerUnavailable as e:
+            log.error("transition failed: %s", e)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="audit ledger unavailable") from e
+        log.info("incident %s -> %s by %s (as %s)", body.incident_id, body.state,
+                 principal.subject, authorised_as)
+        return {**out, "actor": principal.subject, "authorised_as": authorised_as}
 
     return r
