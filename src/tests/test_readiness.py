@@ -260,3 +260,173 @@ def test_no_route_can_execute_a_playbook_because_nothing_here_can():
             assert tool not in text, (
                 f"{src.name} references {tool!r}: provisioning is REQUESTED here "
                 f"and executed by the runner (§5.3)")
+
+
+# ── the UI mount, which the route inventory above cannot see ────────────────
+#
+# `test_only_phase_one_routes_are_mounted` reads app.openapi(), and the SPA
+# fallback is registered with include_in_schema=False, so it is INVISIBLE there.
+# That is the same shape of hole as the earlier one where app.routes did not
+# flatten an included router and the assertions were vacuous: a route that answers
+# every path is exactly what an exhaustive inventory exists to catch, and hiding it
+# from the schema hides it from the test.
+#
+# So these assert it directly.
+
+
+def _paths(app) -> set:
+    out = set()
+    for r in app.routes:
+        for m in getattr(r, "methods", set()) or set():
+            if m not in ("HEAD", "OPTIONS"):
+                out.add((m, getattr(r, "path", "")))
+    return out
+
+
+def test_the_only_unlisted_route_is_the_spa_fallback(tmp_path, monkeypatch):
+    # If another route is ever added with include_in_schema=False, this fails —
+    # which is the point, because the schema-based inventory would not.
+    from admin_master_control import app as app_mod
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><title>x</title>")
+    monkeypatch.setattr(app_mod, "WEB_DIST", dist)
+
+    served = _paths(app_mod.build_app(_cfg(), _owned()))
+    documented = {(m, p) for m, p in _served(app_mod.build_app(_cfg(), _owned()))}
+    undocumented = {(m, p) for m, p in served if (m, p) not in documented}
+    # /docs, /redoc and /openapi.json were here too, unauthenticated, on the
+    # PUBLIC listener — the complete route inventory of the cross-tenant console,
+    # free to anyone with the URL. That contradicted the rule that puts the other
+    # unauthenticated endpoints on the loopback-only monitoring port, so they are
+    # off unless AMC_SERVE_API_DOCS says otherwise. This test is how they were
+    # found: the schema-based inventory cannot see them.
+    assert undocumented == {("GET", "/{path:path}")}, (
+        f"unlisted routes beyond the SPA fallback: {sorted(undocumented)}")
+
+
+def test_the_spa_fallback_cannot_answer_an_api_path(tmp_path, monkeypatch):
+    """A catch-all that answered /v1 would turn a 404 into an HTML 200.
+
+    The browser would then report a JSON parse error for what was really a missing
+    route — one of the more expensive wrong error messages available, because it
+    points at the client.
+    """
+    from admin_master_control import app as app_mod
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>x</title>")
+    monkeypatch.setattr(app_mod, "WEB_DIST", dist)
+    client = TestClient(app_mod.build_app(_cfg(), _owned()))
+
+    r = client.get("/v1/no-such-route")
+    assert r.status_code == 404
+    assert "text/html" not in r.headers.get("content-type", "")
+
+    # And a real UI path DOES get the app, so a reload on /tenants/acme works.
+    r = client.get("/tenants/acme")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+
+
+def test_an_api_route_still_wins_over_the_fallback(tmp_path, monkeypatch):
+    # Registration order is what guarantees this; asserted rather than assumed.
+    from admin_master_control import app as app_mod
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>x</title>")
+    monkeypatch.setattr(app_mod, "WEB_DIST", dist)
+    client = TestClient(app_mod.build_app(_cfg(), _owned()))
+
+    r = client.get("/v1/whoami")
+    assert r.status_code in (401, 403), "the API must answer this, not the SPA"
+    assert "text/html" not in r.headers.get("content-type", "")
+
+
+def test_no_ui_is_not_an_error(tmp_path, monkeypatch):
+    # The console is a useful API without a UI; a deployment that has not run the
+    # build should still start.
+    from admin_master_control import app as app_mod
+
+    monkeypatch.setattr(app_mod, "WEB_DIST", tmp_path / "nope")
+    client = TestClient(app_mod.build_app(_cfg(), _owned()))
+    assert client.get("/v1/whoami").status_code in (401, 403)
+    assert client.get("/tenants").status_code == 404
+
+
+def test_the_fallback_does_not_serve_files_outside_dist(tmp_path, monkeypatch):
+    # A path-traversal guard on a handler that takes a path and returns a file.
+    from admin_master_control import app as app_mod
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>x</title>")
+    (tmp_path / "secret.txt").write_text("not for the web")
+    monkeypatch.setattr(app_mod, "WEB_DIST", dist)
+    client = TestClient(app_mod.build_app(_cfg(), _owned()))
+
+    r = client.get("/../secret.txt")
+    assert "not for the web" not in r.text
+    r = client.get("/%2e%2e/secret.txt")
+    assert "not for the web" not in r.text
+
+
+def test_the_api_docs_are_off_by_default():
+    from admin_master_control.app import build_app
+
+    served = _paths(build_app(_cfg(), _owned()))
+    for p in ("/docs", "/redoc", "/openapi.json"):
+        assert ("GET", p) not in served, f"{p} is unauthenticated on the public listener"
+
+
+def test_the_schema_is_still_introspectable_with_the_docs_off():
+    # Disabling the ROUTE must not disable app.openapi(), or the exhaustive route
+    # inventory above would quietly stop checking anything.
+    from admin_master_control.app import build_app
+
+    assert len(build_app(_cfg(), _owned()).openapi()["paths"]) > 10
+
+
+def test_turning_the_docs_on_is_reported_by_readiness():
+    from admin_master_control.app import build_app, build_monitoring
+
+    c = _cfg(serve_api_docs=True)
+    problems = TestClient(build_monitoring(c, _owned(), _owned_directory())) \
+        .get("/readyz").json().get("problems", [])
+    assert any("API docs" in p for p in problems)
+    # And they really are mounted when asked for — the flag is not decorative.
+    assert ("GET", "/docs") in _paths(build_app(c, _owned()))
+
+
+def test_the_fallback_does_not_answer_for_monitoring_or_docs(tmp_path, monkeypatch):
+    """A 200 of HTML on /readyz is a FALSE HEALTHY, and nobody investigates those.
+
+    Found over the dev tunnel: /readyz returned 200 with index.html because it is
+    not a /v1 path, so the SPA fallback took it. The real monitoring endpoints are
+    on the loopback-only listener and are meant to be unreachable from outside — an
+    external probe should get a 404, not a page that reads as ready.
+
+    /openapi.json is the same shape of problem in a different direction: with the
+    docs off, a client asking for it would get HTML with a 200 and fail on parsing
+    rather than on the 404 that is true.
+    """
+    from admin_master_control import app as app_mod
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>x</title>")
+    monkeypatch.setattr(app_mod, "WEB_DIST", dist)
+    client = TestClient(app_mod.build_app(_cfg(), _owned()))
+
+    for path in ("/readyz", "/healthz", "/poolz", "/metrics",
+                 "/docs", "/redoc", "/openapi.json"):
+        r = client.get(path)
+        assert r.status_code == 404, f"{path} should not be answered by the SPA"
+        assert "text/html" not in r.headers.get("content-type", ""), path
+
+    # And a genuine UI route is still served, so the narrowing did not overreach.
+    assert client.get("/tenants").status_code == 200
+    assert client.get("/security").status_code == 200

@@ -23,9 +23,10 @@ unauthenticated.
 from __future__ import annotations
 
 import logging
+import pathlib
 import threading
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from . import metrics as _fe_metrics
@@ -83,7 +84,20 @@ def build_app(config: Config,
     startup that reaches for a global would make that impossible without LDAP
     and a database.
     """
-    app = FastAPI(title="FileEngine System Administration", version=__version__)
+    app = FastAPI(
+        title="FileEngine System Administration",
+        version=__version__,
+        # None removes the ROUTE. app.openapi() still works, so the tests that
+        # assert the served surface are unaffected — they read the schema through
+        # the method, not over HTTP.
+        docs_url="/docs" if config.serve_api_docs else None,
+        redoc_url="/redoc" if config.serve_api_docs else None,
+        openapi_url="/openapi.json" if config.serve_api_docs else None,
+    )
+    if config.serve_api_docs:
+        log.warning("AMC_SERVE_API_DOCS is on — /docs and /openapi.json are "
+                    "UNAUTHENTICATED on the public listener and publish this "
+                    "console's whole route inventory")
     app.state.config = config
     app.state.registry = registry if registry is not None else AdministratorRegistry()
     app.state.directory = directory if directory is not None else default_directory(config)
@@ -131,6 +145,91 @@ def build_app(config: Config,
                                     app.state.incidents, app.state.erasures,
                                     app.state.resolver, app.state.tenants,
                                     app.state.factors))
+    mount_web(app)
+    return app
+
+
+#: The built console UI, relative to the repository root. Vite writes it here.
+WEB_DIST = pathlib.Path(__file__).resolve().parents[2] / "web" / "dist"
+
+#: First path segment values the SPA fallback refuses. See mount_web.
+_NOT_SPA = frozenset({
+    "healthz", "readyz", "poolz", "metrics",
+    "docs", "redoc", "openapi.json",
+})
+
+
+def mount_web(app: FastAPI) -> None:
+    """Serve the built Vue console from this same app, if it has been built.
+
+    SAME ORIGIN, deliberately. The UI could be served by Vite or any static host,
+    but then every authenticated request is cross-origin: CORS on the console that
+    reads every tenant's audit, a preflight on each call, and an allow-list to keep
+    correct. Serving the bundle here means the browser's origin and the API's are
+    the same and none of that exists.
+
+    It also makes the dev tunnel work. The ngrok account allows ONE agent session,
+    so the console and its UI have to share a single endpoint; two origins would
+    need two.
+
+    MOUNTED LAST, after the API router, so nothing here can shadow /v1. That
+    ordering is the whole safety property of this function: a catch-all mounted
+    first would answer API paths with index.html, and a 404 from the API would
+    arrive at the browser as a 200 containing HTML — which fetch() then fails to
+    parse, reporting a JSON error for what was really a missing route.
+
+    Absent dist is not an error. The console is a useful API without a UI, and a
+    deployment that has not run `npm run build` should not fail to start.
+    """
+    #: Paths the SPA must NOT answer, beyond /v1.
+    #:
+    #: Found over the tunnel: `GET /readyz` returned 200 with index.html, because
+    #: it is not a /v1 path and the fallback took it. The monitoring endpoints live
+    #: on the loopback-only listener and are deliberately unreachable from outside
+    #: — but an external health check pointed here would have read that 200 as
+    #: "ready" without the service having been asked anything. A false healthy is
+    #: worse than an unreachable probe, because nobody investigates it.
+    #:
+    #: The docs paths are here for the adjacent reason: with AMC_SERVE_API_DOCS off
+    #: the routes are gone, and a client fetching /openapi.json would otherwise get
+    #: HTML with a 200 and fail on parsing it rather than on the 404 that is true.
+    #:
+    #: (The production reverse proxy blocks the monitoring paths too. This is the
+    #: same rule applied where the SPA could otherwise answer for them.)
+    if not WEB_DIST.is_dir():
+        log.info("no built UI at %s — serving the API only "
+                 "(cd web && npm install && npm run build)", WEB_DIST)
+        return
+
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    index = WEB_DIST / "index.html"
+    assets = WEB_DIST / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str):
+        """The history-mode fallback.
+
+        Vue Router uses real paths (/tenants/acme), so a reload has to return the
+        app rather than 404. But ONLY for paths the API does not own: /v1 is
+        answered above by the router — this handler is registered after it, so it
+        never sees those — and it is refused here as well rather than relying on
+        that, because a catch-all that could answer an API path would turn a
+        genuine 404 into an HTML 200 and the error would surface as a JSON parse
+        failure in the browser instead.
+        """
+        if path.startswith("v1/") or path.split("/")[0] in _NOT_SPA:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        # A real file, if it is one (favicon, manifest); otherwise the app.
+        candidate = (WEB_DIST / path).resolve()
+        if path and candidate.is_file() and candidate.is_relative_to(WEB_DIST.resolve()):
+            return FileResponse(candidate)
+        return FileResponse(index)
+
+    log.info("serving the console UI from %s", WEB_DIST)
     return app
 
 
@@ -200,6 +299,11 @@ def build_monitoring(config: Config,
                             "will be refused")
         if config.monitoring_is_public():
             problems.append(f"monitoring bound off-loopback ({config.monitor_host})")
+        if config.serve_api_docs:
+            # Same class as the line above: an unauthenticated surface where this
+            # deployment's convention says there should not be one.
+            problems.append("API docs are served (AMC_SERVE_API_DOCS) — /docs and "
+                            "/openapi.json are unauthenticated on the public listener")
         if not config.audit_url:
             problems.append("no audit ledger configured — nothing to display (§5.1)")
         # THE DIRECTORY IS AUTHORITATIVE, so this asks it — not the ledger.

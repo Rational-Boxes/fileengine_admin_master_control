@@ -166,6 +166,22 @@ class Config:
     # password and a proven factor, so: short.
     mfa_challenge_ttl_s: int = field(default_factory=lambda: _int("AMC_MFA_CHALLENGE_TTL_S", 600))
 
+    # FastAPI's /docs, /redoc and /openapi.json. OFF at this tier, and the
+    # default is the decision.
+    #
+    # They are UNAUTHENTICATED, and they sit on the public listener — unlike
+    # /healthz /readyz /poolz /metrics, which are on the loopback-only monitoring
+    # port precisely because they are unauthenticated. Leaving them on published
+    # the complete route inventory and request schemas of the cross-tenant console
+    # to anyone who found the URL: 24 paths, measured over the dev tunnel on
+    # 2026-09-29, including every /v1/security and /v1/administrators route.
+    #
+    # Not a vulnerability by itself — knowing a route exists is not reaching it —
+    # but it is a free map of the most sensitive surface in the estate, and it
+    # contradicts the rule the rest of this application follows. /readyz reports
+    # it when it is on, the same way it reports MFA being disabled.
+    serve_api_docs: bool = field(default_factory=lambda: _bool("AMC_SERVE_API_DOCS", False))
+
     # ── The first administrator (§6.3) ─────────────────────────────────────
     # The first system_owner comes from provisioning, the way a tenant's first
     # administrator does in tenant.yml. Empty means "no owner yet", which
