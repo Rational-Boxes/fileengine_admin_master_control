@@ -181,6 +181,10 @@ def test_only_phase_one_routes_are_mounted():
         ("POST", "/v1/tenants/{tenant_id}/dns-check"),
         ("POST", "/v1/tenants/{tenant_id}/dns-override"),
         ("POST", "/v1/tenants/{tenant_id}/provision"),
+        # The queue the runner reads. A top-level path rather than /tenants/jobs,
+        # which would collide with /tenants/{tenant_id} and be resolved by
+        # declaration order.
+        ("GET", "/v1/provisioning-jobs"),
     }
 
 

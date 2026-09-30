@@ -35,6 +35,7 @@ from .api import build_router
 from .incidents import IncidentSource, from_config as incidents_from_config
 from .mfa import FactorStore, from_config as factors_from_config
 from .redactions import ErasureSource, StaticErasures
+from .tenant_store import TenantStore, from_config as tenant_store_from_config
 from .tenants import Resolver, SystemResolver
 from .auth import (
     DeploymentDirectory,
@@ -72,7 +73,8 @@ def build_app(config: Config,
               incidents: IncidentSource | None = None,
               erasures: ErasureSource | None = None,
               resolver: Resolver | None = None,
-              factors: FactorStore | None = None) -> FastAPI:
+              factors: FactorStore | None = None,
+              tenants: TenantStore | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
@@ -97,8 +99,11 @@ def build_app(config: Config,
     # override. That is deliberate: a local lookup masquerading as proof is how a
     # premature run burns the domain's certificate rate limit.
     app.state.resolver = resolver if resolver is not None else SystemResolver()
-    app.state.tenant_requests = {}
-    app.state.provisioning_jobs = []
+    # Tenant requests live in the DATABASE, not on app.state. They were a dict,
+    # which lost every in-flight request on restart — and, more importantly, could
+    # not make the provisioning gate safe: two administrators pressing Provision at
+    # once both read `verified` and both queued a run. See tenant_store.py.
+    app.state.tenants = tenants if tenants is not None else tenant_store_from_config(config)
     # The second-factor store. None when unconfigured, which is NOT "MFA off":
     # MfaGate refuses every login while the requirement stands, because a
     # requirement that evaporates on the deployment that misconfigured it is not a
@@ -124,8 +129,8 @@ def build_app(config: Config,
     # is a route somebody will wire up.
     app.include_router(build_router(config, app.state.registry, app.state.directory,
                                     app.state.incidents, app.state.erasures,
-                                    app.state.resolver, app.state.tenant_requests,
-                                    app.state.provisioning_jobs, app.state.factors))
+                                    app.state.resolver, app.state.tenants,
+                                    app.state.factors))
     return app
 
 
