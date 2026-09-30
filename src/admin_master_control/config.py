@@ -113,10 +113,58 @@ class Config:
     # not a check someone remembered to write.
     token_audience: str = field(default_factory=lambda: _env("AMC_TOKEN_AUDIENCE", "fileengine-system-admin"))
     jwt_secret: str = field(default_factory=lambda: _env("AMC_JWT_SECRET", ""))
-    # MFA is mandatory at this tier, not policy-dependent. Off is a development
-    # convenience and /readyz reports it, so a deployment cannot run this way
-    # without the fact being visible.
+    # ── the second factor (§6) ─────────────────────────────────────────────
+    #
+    # DEFAULT ON, and the only way out is to say so: `AMC_REQUIRE_MFA=false` is an
+    # explicit opt-out, /readyz reports it, and startup logs it. A deployment
+    # cannot run this way without the fact being visible.
+    #
+    # `require_mfa` means a factor is VERIFIED. It used to mean the caller had
+    # CLAIMED one, which made it decorative: `second_factor` was a self-asserted
+    # string checked against a set of factor NAMES, so anyone holding a directory
+    # password could send {"second_factor":"totp"} and receive a fully MFA-marked
+    # token.
+    #
+    # It also implies FORCED ENROLLMENT on first login. An administrator with no
+    # factor is not admitted and then nagged; they get an enrollment-only session
+    # and nothing else until they finish. Otherwise "required" means "required of
+    # whoever already happens to have one" — nobody, on a new deployment.
     require_mfa: bool = field(default_factory=lambda: _bool("AMC_REQUIRE_MFA", True))
+
+    # Where the factor actually lives. ldap_manager owns `user_2fa`, keyed by uid
+    # ALONE and shared across tenants, so an administrator who enrolled through a
+    # tenant already has a factor this tier can verify — one enrollment, not one
+    # per door. Unset while require_mfa is true is a MISCONFIGURATION, not a
+    # silent pass: /readyz reports it and the gate refuses, because enforcement
+    # that cannot reach its source must not wave everyone through.
+    mfa_url: str = field(default_factory=lambda: _env(
+        "AMC_MFA_URL", _env("AMC_LDAP_MANAGER_URL", "")))
+    # Guards ldap_manager's /internal/2fa/* endpoints, sent as X-Internal-Auth.
+    # Shared with its MFA_INTERNAL_SECRET: it serves 404 when that is unset and
+    # 403 on a mismatch.
+    mfa_internal_secret: str = field(default_factory=lambda: _env(
+        "AMC_MFA_INTERNAL_SECRET", _env("MFA_INTERNAL_SECRET", "")))
+
+    # The methods permitted AT THIS TIER — narrower than the deployment cap on
+    # purpose. `email` is left out: it is the weakest path on offer and this is
+    # the console that reads every tenant's audit and grants deployment
+    # authority. `recovery` is kept, because losing the only factor here means
+    # nobody can grant authority to anybody — the stranded state /readyz reports.
+    mfa_methods: str = field(default_factory=lambda: _env("AMC_MFA_METHODS", "totp,recovery"))
+
+    # ldap_manager's internal 2FA endpoints are tenant-addressed and resolve
+    # permitted methods as "deployment cap ∩ that tenant's policy". Deployment
+    # roles live outside every tenant OU, so no tenant's policy should govern
+    # them — and passing a REAL tenant would let its admin disable TOTP and
+    # thereby block enrollment for this console. A tenant with no policy row
+    # inherits the full cap, so this sentinel resolves to the cap and nothing
+    # narrower. It must not name a real tenant.
+    mfa_tenant_context: str = field(default_factory=lambda: _env(
+        "AMC_MFA_TENANT_CONTEXT", "__deployment__"))
+
+    # How long the pre-session challenge lives — the window between a correct
+    # password and a proven factor, so: short.
+    mfa_challenge_ttl_s: int = field(default_factory=lambda: _int("AMC_MFA_CHALLENGE_TTL_S", 600))
 
     # ── The first administrator (§6.3) ─────────────────────────────────────
     # The first system_owner comes from provisioning, the way a tenant's first
@@ -133,6 +181,27 @@ class Config:
     # administrator can grant every power and exercise none.
     bootstrap_owner_all_roles: bool = field(
         default_factory=lambda: _bool("AMC_BOOTSTRAP_OWNER_ALL_ROLES", True))
+
+    def mfa_method_list(self) -> tuple[str, ...]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for m in self.mfa_methods.split(","):
+            m = m.strip().lower()
+            if m and m not in seen:
+                seen.add(m)
+                out.append(m)
+        return tuple(out)
+
+    def mfa_is_enforceable(self) -> bool:
+        """Whether the requirement can be checked against anything at all.
+
+        Both halves are needed: a URL with no internal secret gets 403 from every
+        endpoint, and a secret with no URL has nothing to call. Separating
+        "enforced" from "enforceable" is what stops this becoming the mistake the
+        tenant-state gate was written to avoid — a check that is decorative on
+        exactly the deployment that forgot to wire it.
+        """
+        return bool(self.mfa_url and self.mfa_internal_secret)
 
     def monitoring_is_public(self) -> bool:
         """True when the monitoring listener is bound off-loopback — which the

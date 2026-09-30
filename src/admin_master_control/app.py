@@ -33,6 +33,7 @@ from . import __version__
 from .administrators import AdministratorRegistry, bootstrap_owner, summarise
 from .api import build_router
 from .incidents import IncidentSource, from_config as incidents_from_config
+from .mfa import FactorStore, from_config as factors_from_config
 from .redactions import ErasureSource, StaticErasures
 from .tenants import Resolver, SystemResolver
 from .auth import (
@@ -70,7 +71,8 @@ def build_app(config: Config,
               directory: DeploymentDirectory | None = None,
               incidents: IncidentSource | None = None,
               erasures: ErasureSource | None = None,
-              resolver: Resolver | None = None) -> FastAPI:
+              resolver: Resolver | None = None,
+              factors: FactorStore | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
@@ -97,6 +99,18 @@ def build_app(config: Config,
     app.state.resolver = resolver if resolver is not None else SystemResolver()
     app.state.tenant_requests = {}
     app.state.provisioning_jobs = []
+    # The second-factor store. None when unconfigured, which is NOT "MFA off":
+    # MfaGate refuses every login while the requirement stands, because a
+    # requirement that evaporates on the deployment that misconfigured it is not a
+    # requirement. AMC_REQUIRE_MFA=false is the only way out, and it is explicit.
+    app.state.factors = factors if factors is not None else factors_from_config(config)
+    if config.require_mfa and app.state.factors is None:
+        log.error("a second factor is REQUIRED but no store is configured — set "
+                  "AMC_MFA_URL and AMC_MFA_INTERNAL_SECRET, or opt out explicitly "
+                  "with AMC_REQUIRE_MFA=false. Every login will be refused.")
+    elif not config.require_mfa:
+        log.warning("AMC_REQUIRE_MFA is false — this deployment admits the "
+                    "cross-tenant console on a password alone")
     apply_bootstrap(config, app.state.registry)
 
     # PHASE 1 (§8.1): read-only, plus the door in front of it and the grant
@@ -111,7 +125,7 @@ def build_app(config: Config,
     app.include_router(build_router(config, app.state.registry, app.state.directory,
                                     app.state.incidents, app.state.erasures,
                                     app.state.resolver, app.state.tenant_requests,
-                                    app.state.provisioning_jobs))
+                                    app.state.provisioning_jobs, app.state.factors))
     return app
 
 
@@ -171,6 +185,14 @@ def build_monitoring(config: Config,
             problems.append("no distinct token audience — a tenant token could be accepted")
         if not config.require_mfa:
             problems.append("MFA disabled — mandatory at this tier (§6)")
+        elif not config.mfa_is_enforceable():
+            # Required, and nothing to check it against. Reported separately from
+            # "disabled" because the deployment believes it is enforcing: this is
+            # the state in which the requirement is decorative, and it is exactly
+            # the trap the tenant-state gate was written to avoid.
+            problems.append("a second factor is required but no store is configured "
+                            "(AMC_MFA_URL / AMC_MFA_INTERNAL_SECRET) — every login "
+                            "will be refused")
         if config.monitoring_is_public():
             problems.append(f"monitoring bound off-loopback ({config.monitor_host})")
         if not config.audit_url:

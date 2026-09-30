@@ -37,6 +37,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from . import _harness
 from admin_master_control import tenants as t
 from admin_master_control.administrators import AdministratorRegistry, bootstrap_owner
 from admin_master_control.app import build_app
@@ -319,6 +320,11 @@ def _cfg() -> Config:
     c.require_mfa = True
     c.monitor_host = "127.0.0.1"
     c.audit_url = "http://audit:8097"
+    # A second factor is required (the default), so it must also be CHECKABLE.
+    # Readiness reports "required but no store configured" otherwise, which is the
+    # point: enforcement that cannot reach its source refuses every login.
+    c.mfa_url = "http://ldap-manager:8093"
+    c.mfa_internal_secret = "internal-shared-secret"
     c.bootstrap_owner = ""
     return c
 
@@ -332,14 +338,12 @@ def _client(resolver=None):
     reg = AdministratorRegistry()
     bootstrap_owner(reg, "james@rationalboxes.com")
     return TestClient(build_app(_cfg(), reg, d, None, None,
-                                resolver if resolver is not None else _ready()))
+                                resolver if resolver is not None else _ready(),
+                                _harness.factors(TEN, OBS, SEC)))
 
 
 def _hdr(client, who=TEN):
-    r = client.post("/v1/auth/token",
-                    json={"subject": who, "password": "pw", "second_factor": "totp"})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    return _harness.headers(client, who)
 
 
 def _body(tenant_id="acme"):

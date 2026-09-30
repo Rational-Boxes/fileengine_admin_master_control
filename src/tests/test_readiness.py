@@ -24,6 +24,11 @@ def _cfg(**over) -> Config:
     c.require_mfa = True
     c.monitor_host = "127.0.0.1"
     c.audit_url = "http://audit:8090"
+    # A second factor is required (the default), so it must also be CHECKABLE.
+    # Readiness reports "required but no store configured" otherwise, which is the
+    # point: enforcement that cannot reach its source refuses every login.
+    c.mfa_url = "http://ldap-manager:8093"
+    c.mfa_internal_secret = "internal-shared-secret"
     for k, v in over.items():
         setattr(c, k, v)
     return c
@@ -141,6 +146,12 @@ def test_only_phase_one_routes_are_mounted():
     from admin_master_control.app import build_app
     assert _served(build_app(_cfg(), _owned())) == {
         ("POST", "/v1/auth/token"),
+        # §6, the second factor. Three routes, and they are the ONLY ones a
+        # challenge token reaches — a challenge carries a different audience, so
+        # it is structurally not a session.
+        ("POST", "/v1/auth/mfa/enroll/begin"),
+        ("POST", "/v1/auth/mfa/enroll/complete"),
+        ("POST", "/v1/auth/mfa/verify"),
         ("GET", "/v1/whoami"),
         ("GET", "/v1/administrators"),
         ("GET", "/v1/administrators/{subject}/history"),
@@ -191,6 +202,12 @@ def test_every_write_is_a_record_or_a_request_never_an_execution():
               if method in {"POST", "PUT", "PATCH", "DELETE"}}
     assert writes == {
         "/v1/auth/token",
+        # The second factor. These write to ldap_manager's `user_2fa` — an
+        # enrolment, which is a record of a credential this administrator now
+        # holds, not an action taken on the estate.
+        "/v1/auth/mfa/enroll/begin",
+        "/v1/auth/mfa/enroll/complete",
+        "/v1/auth/mfa/verify",
         # Records, in this application's own append-only ledger.
         "/v1/grants",
         "/v1/revocations",

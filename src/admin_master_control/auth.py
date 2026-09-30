@@ -61,6 +61,12 @@ log = logging.getLogger("admin_master_control.auth")
 
 #: Authentication methods that count as a SECOND factor. "pwd" is not among
 #: them, deliberately — it is the first.
+#: Factor names that count as a second factor in an `amr`.
+#:
+#: Only ever compared against an amr THIS SERVICE MINTED, never against caller
+#: input. It was once both, which was the hole: `login()` took the caller's string
+#: and, if it appeared here, appended it to the amr it then signed. Which methods
+#: a login may actually USE is Config.mfa_methods, deliberately narrower.
 SECOND_FACTORS = frozenset({"totp", "webauthn", "recovery", "email", "oauth"})
 
 
@@ -273,6 +279,80 @@ def mint_token(config: Config, principal: Principal, *, ttl_seconds: int = 3600)
     return jwt.encode(payload, config.jwt_secret, algorithm="HS256")
 
 
+#: Why a challenge token exists. Never a session, and never interchangeable.
+CHALLENGE_VERIFY = "verify"
+CHALLENGE_ENROLL = "enroll"
+
+
+def challenge_audience(config: Config) -> str:
+    """A DISTINCT audience for the pre-session challenge.
+
+    This is the structural half of "an un-enrolled administrator can reach
+    enrollment and nothing else". PyJWT is given the audience to validate, so a
+    challenge token presented to `principal_from_header` fails
+    signature-and-claim validation together — it is not a check that a later
+    refactor can drop, and there is no code path where a challenge is accepted as
+    a session because it never satisfies the session audience.
+    """
+    return f"{config.token_audience}:challenge"
+
+
+def mint_challenge(config: Config, principal: Principal, purpose: str) -> str:
+    """A short-lived token that permits ONE next step and nothing else.
+
+    It carries the roles so the step that follows does not re-read the directory,
+    but they are inert: nothing authorises off a challenge, because the gate on
+    every real route verifies against the session audience.
+    """
+    if not config.jwt_secret:
+        raise AuthError("no token secret configured",
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    if purpose not in (CHALLENGE_VERIFY, CHALLENGE_ENROLL):
+        raise AuthError(f"unknown challenge purpose {purpose!r}")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    payload = {
+        "sub": principal.subject,
+        "aud": challenge_audience(config),
+        "iss": "admin-master-control",
+        "iat": int(now.timestamp()),
+        "exp": int((now + _dt.timedelta(seconds=config.mfa_challenge_ttl_s)).timestamp()),
+        "purpose": purpose,
+        "roles": sorted(principal.roles),
+        # NO amr. A challenge has proved a password and nothing more, and an amr
+        # here would be the same self-assertion this rewrite removed.
+    }
+    return jwt.encode(payload, config.jwt_secret, algorithm="HS256")
+
+
+def verify_challenge(config: Config, token: str, expect: str) -> Principal:
+    """Verify a challenge token for a SPECIFIC purpose.
+
+    `expect` is required rather than optional: an enrollment challenge must not
+    complete a verification, nor the reverse. Someone already enrolled should not
+    be able to take the enrollment path and overwrite their factor with one they
+    chose after a password-only login.
+    """
+    if not config.jwt_secret:
+        raise AuthError("no token secret configured",
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    try:
+        claims = jwt.decode(token, config.jwt_secret, algorithms=["HS256"],
+                            audience=challenge_audience(config),
+                            options={"require": ["exp", "sub", "aud"]})
+    except jwt.ExpiredSignatureError as e:
+        raise AuthError("the challenge has expired; sign in again") from e
+    except Exception as e:  # noqa: BLE001
+        raise AuthError("invalid challenge") from e
+    if str(claims.get("purpose") or "") != expect:
+        raise AuthError(f"this challenge is not for {expect}")
+    subject = str(claims.get("sub") or "")
+    if not subject:
+        raise AuthError("invalid challenge")
+    return Principal(subject=subject,
+                     roles=frozenset(claims.get("roles") or ()),
+                     amr=("pwd",))
+
+
 def verify_token(config: Config, token: str) -> Principal:
     """Verify a token minted here. Refuses anything minted anywhere else.
 
@@ -309,9 +389,19 @@ def verify_token(config: Config, token: str) -> Principal:
 # ── login ──────────────────────────────────────────────────────────────────
 
 
-def login(config: Config, directory: DeploymentDirectory, subject: str, password: str,
-          *, second_factor: Optional[str] = None) -> Principal:
+def login(config: Config, directory: DeploymentDirectory, subject: str, password: str) -> Principal:
     """Authenticate an administrator and resolve their authority.
+
+    Returns a PASSWORD-ONLY principal (`amr = ["pwd"]`). It is not a session and
+    must not be minted as one while a second factor is required — `MfaGate`
+    decides what a correct password entitles someone to, and `mfa.py` says why
+    this function no longer takes the factor as an argument.
+
+    It used to take `second_factor` as a STRING, check it against a set of factor
+    NAMES, and append it to `amr`. Nothing verified a code, so anyone holding a
+    directory password could send {"second_factor":"totp"} and receive a fully
+    MFA-marked token. The parameter is gone rather than deprecated: leaving it
+    would leave the hole reachable.
 
     Order matters. The password is checked first, then the roles are read — a
     caller who cannot bind never learns whether the account holds authority,
@@ -328,12 +418,7 @@ def login(config: Config, directory: DeploymentDirectory, subject: str, password
         raise AuthError(f"{subject} holds no deployment role",
                         status_code=status.HTTP_403_FORBIDDEN)
 
-    amr = ["pwd"]
-    if second_factor:
-        if second_factor not in SECOND_FACTORS:
-            raise AuthError(f"unknown second factor {second_factor!r}")
-        amr.append(second_factor)
-    return Principal(subject=subject, roles=roles, amr=tuple(amr))
+    return Principal(subject=subject, roles=roles, amr=("pwd",))
 
 
 # ── the gate ───────────────────────────────────────────────────────────────
