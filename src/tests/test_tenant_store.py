@@ -409,7 +409,29 @@ live = pytest.mark.skipif(not os.environ.get("AMC_TEST_PG_DSN"),
 
 @pytest.fixture()
 def pg():
-    store = PostgresTenantStore(dsn=os.environ["AMC_TEST_PG_DSN"])
+    """A CLEAN store — and it will only clean a database that says it is for tests.
+
+    This fixture TRUNCATES both tables. Pointed at `admin_master_control` on the
+    dev Postgres, it deleted the console's real in-flight requests and the queued
+    provisioning job — noticed only because a later check over the tunnel reported
+    three requests where there had been four. A test that destroys the data it is
+    run beside is a worse problem than whatever it was checking.
+
+    So the name must contain "test". This is a guard, not a convention: the whole
+    point is that the obvious DSN to reach for is the real one.
+
+        createdb -h localhost -p 5434 -U postgres admin_master_control_test
+        AMC_TEST_PG_DSN="host=localhost port=5434 dbname=admin_master_control_test \
+            user=postgres password=postgres" python -m pytest src/tests/test_tenant_store.py
+    """
+    dsn = os.environ["AMC_TEST_PG_DSN"]
+    if "test" not in dsn.lower():
+        pytest.fail(
+            "AMC_TEST_PG_DSN does not name a test database, and this fixture "
+            "TRUNCATES tenant_request and provisioning_job. Point it at a "
+            "database whose name contains 'test' — not at the one the console "
+            "is actually using.")
+    store = PostgresTenantStore(dsn=dsn)
     store.ensure_schema()
     with store._connect() as conn:
         with conn.cursor() as cur:
