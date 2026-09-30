@@ -256,14 +256,52 @@ describe('interface hostnames are folded under their tenant', () => {
     expect(w.text()).toContain('no tenant to belong to')
   })
 
-  it('lists the interfaces of a real tenant as hostnames, not as tenants', async () => {
+  it('nests each interface subdomain under the tenant, with its own role', async () => {
     const w = await view([
       row({ tenant_id: 'acme', state: 'awaiting_dns', may_provision: false,
             hostnames: ['acme.example.com', 'acme-drive.example.com',
                         'acme-mcp.example.com'] }),
     ])
-    expect(w.text()).toContain('3 interfaces')
-    expect(w.text()).toContain('acme-mcp.example.com')
+    const ifaces = w.findAll('tr.iface')
+    expect(ifaces).toHaveLength(3)
+    expect(ifaces[0].text()).toContain('acme.example.com')
+    expect(ifaces[0].text()).toContain('tenant')
+    expect(ifaces[1].text()).toContain('acme-drive.example.com')
+    expect(ifaces[1].text()).toContain('drive')
+    expect(ifaces[2].text()).toContain('mcp')
+  })
+
+  it('gives each interface its OWN dns verdict, not the tenant\'s', async () => {
+    // Each is a separate subdomain needing its own record and its own certificate, so a
+    // single "not ready" on the parent would hide WHICH hostname is missing — and the
+    // causes need opposite responses: "no record" improves by waiting, a wrong address
+    // never does.
+    const w = await view([
+      row({
+        tenant_id: 'acme', state: 'awaiting_dns', may_provision: false,
+        hostnames: ['acme.example.com', 'acme-drive.example.com'],
+        dns: {
+          ok: false, authoritative: true, blocking_reason: 'not ready',
+          checks: [
+            { hostname: 'acme.example.com', ok: true, resolved: ['203.0.113.10'],
+              expected: '203.0.113.10', detail: '' },
+            { hostname: 'acme-drive.example.com', ok: false, resolved: [],
+              expected: '203.0.113.10', detail: 'no record' },
+          ],
+        },
+      }),
+    ])
+    const ifaces = w.findAll('tr.iface')
+    expect(ifaces[0].text()).toContain('ok')
+    expect(ifaces[1].text()).toContain('no record')
+  })
+
+  it('says an interface is unchecked rather than implying it passed', async () => {
+    const w = await view([
+      row({ tenant_id: 'acme', state: 'requested', may_provision: false,
+            hostnames: ['acme.example.com', 'acme-drive.example.com'] }),
+    ])
+    expect(w.findAll('tr.iface')[1].text()).toContain('not checked')
   })
 })
 
@@ -419,5 +457,46 @@ describe('the pager', () => {
     await w.find('select#per').setValue('0')
     expect(w.text()).toContain('1–120 of 120')
     expect(w.find('.pager').exists()).toBe(false)
+  })
+})
+
+describe('the list renders alongside the orphan warning', () => {
+  it('still shows the table when an orphan is present', async () => {
+    // THE regression. The orphan notice was placed between `<p v-if="loading">` and
+    // `<table v-else>`, so Vue paired the v-else with the orphan's v-if — and with one
+    // orphan in the registry the table never rendered. Every filter and count still
+    // reported the tenants, so the page looked functional and listed nothing.
+    //
+    // The earlier tests passed because no fixture had BOTH an orphan and an
+    // expectation that the table still appeared; that gap is what this closes.
+    const w = await view([
+      row({ tenant_id: 'default', display_name: 'default', state: 'live',
+            admits_logins: true, may_provision: false }),
+      row({ tenant_id: 'filenginetest', display_name: 'filenginetest', state: 'live',
+            admits_logins: true, may_provision: false }),
+      // The orphan: an interface-shaped id with no tenant to fold under.
+      row({ tenant_id: 'fileenginetest-drive', display_name: 'fileenginetest-drive',
+            state: 'live', admits_logins: true, may_provision: false, shadowed_by: '' }),
+    ])
+    expect(w.text()).toContain('no tenant to belong to')   // the warning
+    expect(w.find('table').exists()).toBe(true)            // AND the table
+    expect(w.text()).toContain('default')
+    expect(w.text()).toContain('filenginetest')
+  })
+
+  it('shows the table when there are no orphans either', async () => {
+    const w = await view([
+      row({ tenant_id: 'default', display_name: 'default', state: 'live',
+            admits_logins: true, may_provision: false }),
+    ])
+    expect(w.text()).not.toContain('no tenant to belong to')
+    expect(w.find('table').exists()).toBe(true)
+  })
+
+  it('shows no table while loading, and no table when the registry is empty', async () => {
+    // The other end of the same chain: the conditions it is actually for.
+    const empty = await view([])
+    expect(empty.find('table').exists()).toBe(false)
+    expect(empty.text()).toContain('No tenants in the registry')
   })
 })

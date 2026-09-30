@@ -92,6 +92,29 @@ const allGroups = computed(() => {
   return top.map((t) => ({ tenant: t, folded: children.get(t.tenant_id) ?? [] }))
 })
 
+/** The interface subdomains of one tenant, each with its own DNS verdict.
+ *
+ * Folded under the tenant's main subdomain because that is what they are — one tenant
+ * served on several hostnames, `<tenant>` and `<tenant>-<interface>`, all resolving
+ * back to the same tenant.
+ *
+ * But each is a SEPARATE SUBDOMAIN needing its own A record and its own certificate,
+ * so each carries its own verdict rather than inheriting the tenant's. A single
+ * "DNS: not ready" on the parent hides which hostname is missing, and the causes need
+ * opposite responses: "no record" improves by waiting, a wrong address never does.
+ */
+function interfacesOf(t: TenantView) {
+  const checks = new Map((t.dns?.checks ?? []).map((c) => [c.hostname, c]))
+  return t.hostnames.map((host, i) => ({
+    host,
+    // The label after the hyphen, or "tenant" for the bare host. Derived from the
+    // hostname rather than from a list of known suffixes, because the estate's rule is
+    // a split: anything after the first hyphen is an interface.
+    role: i === 0 ? 'tenant' : host.split('.')[0].split('-').slice(1).join('-'),
+    check: checks.get(host) ?? null,
+  }))
+}
+
 /** The filtered view.
  *
  * FILTERED AFTER GROUPING, and a group is kept when the parent OR any of its interface
@@ -302,12 +325,35 @@ function stateClass(state: string) {
       </button>
     </form>
 
+    <!-- ABOVE the v-if/v-else chain below, and that placement is load-bearing.
+         Sitting between `<p v-if="loading">` and `<table v-else>`, this `v-if` STOLE
+         the `v-else`: Vue pairs v-else with its immediately preceding conditional, so
+         the table rendered only when there were no orphans — and with one orphan in
+         the registry the whole list vanished while every filter and count still said
+         it was there. Nothing catches that at build time. -->
+    <p v-if="orphans.length" class="notice warn">
+      {{ orphans.length }} registry row{{ orphans.length === 1 ? '' : 's' }}
+      {{ orphans.length === 1 ? 'has' : 'have' }} an interface-shaped id with no tenant
+      to belong to — their hostnames resolve to a tenant that does not exist, so nothing
+      can reach them. They hold a schema and cannot be removed from here.
+    </p>
+
+    <!-- EVERY ONE OF THESE STATES ITS OWN CONDITION. No `v-else` anywhere in this
+         group, deliberately: `v-else` binds to whatever conditional immediately
+         precedes it, so inserting any sibling in the middle silently re-parents it. I
+         did that twice — once with the orphan notice and once with the filter row —
+         and the second time the table rendered only when the list was EMPTY, while
+         every count above it still reported the tenants correctly. Nothing catches it
+         at build time, and it reads as "no tenants" rather than as a broken template.
+
+         Spelling the conditions out costs a few repeated clauses and makes the group
+         insertion-proof. -->
     <p v-if="loading" class="empty">Loading…</p>
-    <p v-else-if="!rows.length" class="empty">
+    <p v-if="!loading && !rows.length" class="empty">
       No tenants in the registry. If the estate is not empty, check that
       AMC_CORE_PG_* points at the core's database.
     </p>
-    <p v-else-if="!grouped.length" class="empty">
+    <p v-if="!loading && rows.length && !grouped.length" class="empty">
       Nothing matches. <button class="link" @click="query = ''; stateFilter = ''">Clear
       the filter</button> to see all {{ rows.length }}.
     </p>
@@ -352,14 +398,7 @@ function stateClass(state: string) {
       </p>
     </div>
 
-    <p v-if="orphans.length" class="notice warn">
-      {{ orphans.length }} registry row{{ orphans.length === 1 ? '' : 's' }}
-      {{ orphans.length === 1 ? 'has' : 'have' }} an interface-shaped id with no tenant
-      to belong to — their hostnames resolve to a tenant that does not exist, so nothing
-      can reach them. They hold a schema and cannot be removed from here.
-    </p>
-
-    <table v-else class="card">
+    <table v-if="!loading && grouped.length" class="card">
       <thead>
         <tr>
           <th>Tenant</th>
@@ -381,12 +420,6 @@ function stateClass(state: string) {
               <div class="muted small mono">{{ g.tenant.tenant_id }}</div>
               <div v-if="g.tenant.base_domain" class="muted small">
                 {{ g.tenant.base_domain }} → {{ g.tenant.address }}
-              </div>
-              <!-- Each interface is a separate subdomain with its own A record and its
-                   own certificate, so they are listed as HOSTNAMES of this tenant. -->
-              <div v-if="g.tenant.hostnames.length > 1" class="muted small ifaces">
-                {{ g.tenant.hostnames.length }} interfaces:
-                <span class="mono">{{ g.tenant.hostnames.join(', ') }}</span>
               </div>
             </td>
             <td>
@@ -448,9 +481,38 @@ function stateClass(state: string) {
               </div>
             </td>
           </tr>
+          <!-- The tenant's own subdomains, folded under it. One tenant, several
+               hostnames — and each needs its own A record and its own certificate, so
+               each shows its own verdict rather than inheriting the tenant's. -->
+          <tr v-for="iface in interfacesOf(g.tenant)" :key="iface.host" class="iface">
+            <td>
+              <span class="tree" aria-hidden="true">└</span>
+              <span class="mono">{{ iface.host }}</span>
+              <span class="pill role">{{ iface.role }}</span>
+            </td>
+            <td colspan="2" class="muted small">
+              needs its own record and certificate
+            </td>
+            <td class="dns">
+              <template v-if="iface.check">
+                <span class="pill" :class="iface.check.ok ? 'ok' : 'bad'">
+                  {{ iface.check.ok ? 'ok' : 'no' }}
+                </span>
+                <!-- The per-hostname detail: "no record" improves by waiting, a wrong
+                     address never does, and a non-authoritative answer means nothing is
+                     wrong with the zone at all. -->
+                <div v-if="iface.check.detail" class="muted small">
+                  {{ iface.check.detail }}
+                </div>
+              </template>
+              <span v-else class="muted small">not checked</span>
+            </td>
+            <td v-if="mayAct"></td>
+          </tr>
+
           <!-- Folded: registry rows that are an INTERFACE HOSTNAME of the tenant above,
-               not tenants of their own. No request can arrive for them; the schema is
-               real and there is nothing here that can remove it. -->
+               registered as tenants of their own. No request can arrive for them; the
+               schema is real and there is nothing here that can remove it. -->
           <tr v-for="c in g.folded" :key="c.tenant_id" class="folded">
             <td colspan="4">
               <span class="mono">{{ c.tenant_id }}</span>
@@ -514,8 +576,21 @@ function stateClass(state: string) {
 .ovr {
   margin-top: 0.25rem;
 }
-.ifaces {
-  margin-top: 0.25rem;
+tr.iface td {
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+  border-bottom: none;
+}
+tr.iface td:first-child {
+  padding-left: 1.5rem;
+}
+.tree {
+  color: var(--muted);
+  margin-right: 0.4rem;
+}
+.pill.role {
+  margin-left: 0.5rem;
+  font-size: 0.7rem;
 }
 .filters {
   align-items: flex-end;
