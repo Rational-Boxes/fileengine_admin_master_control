@@ -538,7 +538,7 @@ def _cfg():
     return c
 
 
-def _client(registry=None, resolver=None):
+def _client(registry=None, resolver=None, tls_probe=None):
     from fastapi.testclient import TestClient
 
     from . import _harness
@@ -558,8 +558,11 @@ def _client(registry=None, resolver=None):
     reg_ = registry if registry is not None else StaticTenantRegistry()
     res = resolver if resolver is not None else StaticResolver(
         answers={h: (ADDR,) for h in hostnames_for("acme", BASE)})
-    app = build_app(_cfg(), admins, d, None, None, res,
-                    _harness.factors(TEN, "obs@x"), reg_, None)
+    # By KEYWORD past the first few: build_app takes ten parameters and a new one
+    # inserted in the middle silently swapped two of them once already.
+    app = build_app(_cfg(), admins, d, resolver=res,
+                    factors=_harness.factors(TEN, "obs@x"),
+                    tenant_registry=reg_, tls_probe=tls_probe)
     return TestClient(app), reg_
 
 
@@ -692,3 +695,124 @@ def test_a_live_tenant_cannot_be_provisioned_again():
     # administrator started it a moment ago" is simply false, and reads as a race
     # that did not happen.
     assert "a moment ago" not in detail
+
+
+# ── DNS and TLS together, on every subdomain ───────────────────────────────
+
+
+def _requested_via_api(c):
+    return c.post("/v1/tenants", headers=_hdr(c), json={
+        "tenant_id": "acme", "base_domain": BASE, "address": ADDR,
+        "initial_admin": "a@acme.test"})
+
+
+def test_verify_reports_dns_and_tls_for_every_subdomain():
+    from admin_master_control.tls import CertCheck, StaticTlsProbe, EXPIRING, VALID
+
+    hosts = [f"acme.{BASE}", f"acme-drive.{BASE}"]
+    probe = StaticTlsProbe(answers={
+        hosts[0]: CertCheck(hostname=hosts[0], state=VALID, days_remaining=80,
+                            covers=(hosts[0],)),
+        hosts[1]: CertCheck(hostname=hosts[1], state=EXPIRING, days_remaining=9,
+                            covers=(hosts[1],), detail="9 day(s) left"),
+    })
+    c, _ = _client(tls_probe=probe)
+    _requested_via_api(c)
+    body = c.post("/v1/tenants/acme/verify", headers=_hdr(c)).json()
+
+    # BOTH halves, and per hostname in each.
+    assert len(body["dns"]["checks"]) == 2
+    assert len(body["tls"]["checks"]) == 2
+    assert body["tls"]["ok"] is False
+    assert body["tls"]["soonest_expiry_days"] == 9
+    assert "9 day(s) left" in body["tls"]["blocking_reason"]
+    # The primary is fine and the service subdomain is not — which is the case a single
+    # verdict on the tenant could not express.
+    assert body["tls"]["checks"][0]["ok"] is True
+    assert body["tls"]["checks"][1]["serving"] is True
+    assert body["tls"]["checks"][1]["ok"] is False
+
+
+def test_a_missing_certificate_before_provisioning_does_not_block_the_gate():
+    """`absent` is EXPECTED for a tenant being created.
+
+    No certificate exists before provisioning, so feeding TLS into the gate would make
+    the gate unpassable — and reporting it as a fault would make every new tenant look
+    broken.
+    """
+    from admin_master_control.tls import StaticTlsProbe
+
+    c, _ = _client(tls_probe=StaticTlsProbe())     # nothing serving anywhere
+    _requested_via_api(c)
+    body = c.post("/v1/tenants/acme/verify", headers=_hdr(c)).json()
+    assert body["tls"]["ok"] is False
+    assert all(ch["state"] == "absent" for ch in body["tls"]["checks"])
+    # DNS passes, so the gate is open regardless of the certificates.
+    assert body["dns"]["ok"] is True
+    assert body["may_provision"] is True
+    assert c.post("/v1/tenants/acme/provision", headers=_hdr(c)).status_code == 202
+
+
+def test_verify_never_changes_a_live_tenants_state():
+    # An expired certificate on a live tenant is serious AND the tenant is still live.
+    # Moving it out of `live` would take the site down to report that its certificate is
+    # about to, which is worse than the fault.
+    from admin_master_control.tls import CertCheck, StaticTlsProbe, EXPIRED
+
+    host = f"acme.{BASE}"
+    r = StaticTenantRegistry().seed(
+        Tenant(tenant_id="acme", schema_name="tenant_acme", state=LIVE,
+               base_domain=BASE, address=ADDR, initial_admin="a@b.c"))
+    probe = StaticTlsProbe(default=CertCheck(hostname=host, state=EXPIRED,
+                                            days_remaining=-3, detail="expired"))
+    c, _ = _client(registry=r, tls_probe=probe)
+    body = c.post("/v1/tenants/acme/verify", headers=_hdr(c)).json()
+    assert body["state"] == LIVE
+    assert body["admits_logins"] is True
+    assert body["tls"]["ok"] is False
+
+
+def test_verify_is_readable_by_the_observer_baseline():
+    # It resolves names and opens TLS connections and changes nothing about the tenant.
+    # Noticing that a certificate expires in nine days should not need the authority to
+    # provision.
+    from admin_master_control.tls import StaticTlsProbe
+
+    c, _ = _client(tls_probe=StaticTlsProbe())
+    _requested_via_api(c)
+    assert c.post("/v1/tenants/acme/verify", headers=_hdr(c, "obs@x")).status_code == 200
+
+
+def test_verify_refuses_an_interface_row_and_says_what_it_is():
+    from admin_master_control.tls import StaticTlsProbe
+
+    r = StaticTenantRegistry().seed(
+        Tenant(tenant_id="acme", schema_name="tenant_acme", state=LIVE,
+               base_domain=BASE, address=ADDR),
+        Tenant(tenant_id="acme-drive", schema_name="tenant_acmedrive", state=LIVE,
+               base_domain=BASE, address=ADDR))
+    c, _ = _client(registry=r, tls_probe=StaticTlsProbe())
+    resp = c.post("/v1/tenants/acme-drive/verify", headers=_hdr(c))
+    assert resp.status_code == 409
+    assert "not a tenant" in resp.json()["detail"]
+
+
+def test_verify_refuses_a_tenant_with_nothing_to_check_against():
+    from admin_master_control.tls import StaticTlsProbe
+
+    r = StaticTenantRegistry().seed(
+        Tenant(tenant_id="default", schema_name="tenant_default", state=LIVE))
+    c, _ = _client(registry=r, tls_probe=StaticTlsProbe())
+    resp = c.post("/v1/tenants/default/verify", headers=_hdr(c))
+    assert resp.status_code == 409
+    assert "not requested through this console" in resp.json()["detail"]
+
+
+def test_the_tls_reading_survives_in_the_registry():
+    from admin_master_control.tls import StaticTlsProbe
+
+    c, r = _client(tls_probe=StaticTlsProbe())
+    _requested_via_api(c)
+    c.post("/v1/tenants/acme/verify", headers=_hdr(c))
+    assert r.get("acme").tls is not None
+    assert r.get("acme").tls["checks"]

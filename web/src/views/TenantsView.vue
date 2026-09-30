@@ -104,15 +104,37 @@ const allGroups = computed(() => {
  * opposite responses: "no record" improves by waiting, a wrong address never does.
  */
 function interfacesOf(t: TenantView) {
-  const checks = new Map((t.dns?.checks ?? []).map((c) => [c.hostname, c]))
+  const dns = new Map((t.dns?.checks ?? []).map((c) => [c.hostname, c]))
+  const tls = new Map((t.tls?.checks ?? []).map((c) => [c.hostname, c]))
   return t.hostnames.map((host, i) => ({
     host,
     // The label after the hyphen, or "tenant" for the bare host. Derived from the
     // hostname rather than from a list of known suffixes, because the estate's rule is
     // a split: anything after the first hyphen is an interface.
     role: i === 0 ? 'tenant' : host.split('.')[0].split('-').slice(1).join('-'),
-    check: checks.get(host) ?? null,
+    check: dns.get(host) ?? null,
+    cert: tls.get(host) ?? null,
   }))
+}
+
+/** How to colour a certificate state.
+ *
+ * `expiring` is AMBER, not green and not red: it is serving and the thing that should
+ * have renewed it has already missed several chances. Green would hide a fault that has
+ * a deadline; red would say the site is down when it is not. `absent` is neutral,
+ * because before provisioning it is simply the truth.
+ */
+function certClass(state: string) {
+  if (state === 'valid') return 'ok'
+  if (state === 'expiring' || state === 'untrusted') return 'warn'
+  if (state === 'expired' || state === 'wrong_host') return 'bad'
+  return ''
+}
+
+function certLabel(c: { state: string; days_remaining: number | null }) {
+  if (c.state === 'valid' && c.days_remaining !== null) return `${c.days_remaining}d`
+  if (c.state === 'expiring' && c.days_remaining !== null) return `${c.days_remaining}d left`
+  return c.state.replace(/_/g, ' ')
 }
 
 /** The filtered view.
@@ -405,6 +427,7 @@ function stateClass(state: string) {
           <th>State</th>
           <th>Logins</th>
           <th>DNS</th>
+          <th>Certificate</th>
           <th v-if="mayAct" class="actions">Actions</th>
         </tr>
       </thead>
@@ -442,16 +465,41 @@ function stateClass(state: string) {
               </template>
               <span v-else class="muted small">not checked</span>
             </td>
+            <td class="dns">
+              <template v-if="g.tenant.tls">
+                <span class="pill" :class="g.tenant.tls.ok ? 'ok'
+                  : g.tenant.tls.serving ? 'warn' : 'bad'">
+                  {{ g.tenant.tls.ok ? 'valid'
+                    : g.tenant.tls.serving ? 'renewal overdue' : 'not serving' }}
+                </span>
+                <!-- A tenant is as renewed as its LEAST renewed subdomain. -->
+                <div v-if="g.tenant.tls.soonest_expiry_days !== null" class="muted small">
+                  soonest expiry {{ g.tenant.tls.soonest_expiry_days }}d
+                </div>
+              </template>
+              <span v-else class="muted small">not checked</span>
+            </td>
             <td v-if="mayAct" class="actions">
               <div class="row">
                 <button class="btn secondary sm" :disabled="busy === g.tenant.tenant_id"
                         @click="rename(g.tenant)">
                   Name
                 </button>
+                <!-- One operation for both halves: does each subdomain resolve, and is
+                     each serving a trusted certificate that covers it. The separate
+                     DNS-only check stays because it is the gate's input and it is what
+                     gets pressed repeatedly while waiting for propagation. -->
                 <button v-if="g.tenant.base_domain" class="btn secondary sm"
                         :disabled="busy === g.tenant.tenant_id"
+                        title="Check DNS and certificates on every subdomain"
+                        @click="act(g.tenant.tenant_id, () => tenants.verify(g.tenant.tenant_id))">
+                  Verify
+                </button>
+                <button v-if="g.tenant.base_domain && !g.tenant.admits_logins"
+                        class="btn secondary sm" :disabled="busy === g.tenant.tenant_id"
+                        title="DNS only — the input to the provisioning gate"
                         @click="act(g.tenant.tenant_id, () => tenants.dnsCheck(g.tenant.tenant_id))">
-                  Check DNS
+                  DNS
                 </button>
                 <button v-if="!g.tenant.admits_logins && g.tenant.base_domain"
                         class="btn secondary sm" :disabled="busy === g.tenant.tenant_id"
@@ -491,7 +539,7 @@ function stateClass(state: string) {
               <span class="pill role">{{ iface.role }}</span>
             </td>
             <td colspan="2" class="muted small">
-              needs its own record and certificate
+              its own record and certificate
             </td>
             <td class="dns">
               <template v-if="iface.check">
@@ -507,6 +555,20 @@ function stateClass(state: string) {
               </template>
               <span v-else class="muted small">not checked</span>
             </td>
+            <td class="dns">
+              <template v-if="iface.cert">
+                <span class="pill" :class="certClass(iface.cert.state)">
+                  {{ certLabel(iface.cert) }}
+                </span>
+                <div v-if="iface.cert.detail" class="muted small">
+                  {{ iface.cert.detail }}
+                </div>
+                <div v-else-if="iface.cert.issuer" class="muted small">
+                  {{ iface.cert.issuer }}
+                </div>
+              </template>
+              <span v-else class="muted small">not checked</span>
+            </td>
             <td v-if="mayAct"></td>
           </tr>
 
@@ -514,7 +576,7 @@ function stateClass(state: string) {
                registered as tenants of their own. No request can arrive for them; the
                schema is real and there is nothing here that can remove it. -->
           <tr v-for="c in g.folded" :key="c.tenant_id" class="folded">
-            <td colspan="4">
+            <td colspan="5">
               <span class="mono">{{ c.tenant_id }}</span>
               <span class="pill warn">not a tenant</span>
               <div class="muted small">

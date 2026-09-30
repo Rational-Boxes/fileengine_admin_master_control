@@ -37,6 +37,7 @@ from .incidents import IncidentSource, from_config as incidents_from_config
 from .mfa import FactorStore, from_config as factors_from_config
 from .redactions import ErasureSource, StaticErasures
 from .job_store import JobStore, from_config as job_store_from_config
+from .tls import SystemTlsProbe
 from .registry import TenantRegistry, from_config as registry_from_config
 from .tenants import Resolver, SystemResolver
 from .auth import (
@@ -78,7 +79,8 @@ def build_app(config: Config,
               factors: FactorStore | None = None,
               # NOT `registry`: that parameter is the AdministratorRegistry.
               tenant_registry: TenantRegistry | None = None,
-              jobs: JobStore | None = None) -> FastAPI:
+              jobs: JobStore | None = None,
+              tls_probe=None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
@@ -126,6 +128,10 @@ def build_app(config: Config,
     # The provisioning queue IS this application's own — the runner needs somewhere
     # to look, and §5.3 puts that boundary here.
     app.state.jobs = jobs if jobs is not None else job_store_from_config(config)
+    # The certificate prober. Real TLS connections, so it is injectable — the tests must
+    # not open sockets, and a test that quietly did would pass or fail on whatever
+    # happened to be listening.
+    app.state.tls_probe = tls_probe if tls_probe is not None else SystemTlsProbe()
     # The second-factor store. None when unconfigured, which is NOT "MFA off":
     # MfaGate refuses every login while the requirement stands, because a
     # requirement that evaporates on the deployment that misconfigured it is not a
@@ -149,10 +155,22 @@ def build_app(config: Config,
     #   phase 4  exclusions   — the destructive tenant-admin tasks
     # They are absent rather than stubbed. A route that exists and returns 501
     # is a route somebody will wire up.
-    app.include_router(build_router(config, app.state.registry, app.state.directory,
-                                    app.state.incidents, app.state.erasures,
-                                    app.state.resolver, app.state.tenant_registry,
-                                    app.state.jobs, app.state.factors))
+    # BY KEYWORD, all of them. This call passed ten positional arguments and a new
+    # parameter inserted into the middle of the signature silently swapped `factors`
+    # with `tls_probe` — which surfaced as `'SystemTlsProbe' object has no attribute
+    # 'status'` from inside the MFA gate, sixty-six tests away from the cause.
+    app.include_router(build_router(
+        config,
+        registry=app.state.registry,
+        directory=app.state.directory,
+        incidents=app.state.incidents,
+        erasures=app.state.erasures,
+        resolver=app.state.resolver,
+        tenant_registry=app.state.tenant_registry,
+        jobs=app.state.jobs,
+        factors=app.state.factors,
+        tls_probe=app.state.tls_probe,
+    ))
     mount_web(app)
     return app
 

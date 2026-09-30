@@ -500,3 +500,98 @@ describe('the list renders alongside the orphan warning', () => {
     expect(empty.text()).toContain('No tenants in the registry')
   })
 })
+
+describe('certificates, per subdomain', () => {
+  const withTls = () =>
+    row({
+      tenant_id: 'acme', state: 'live', admits_logins: true, may_provision: false,
+      hostnames: ['acme.example.com', 'acme-drive.example.com'],
+      tls: {
+        ok: false, serving: true, soonest_expiry_days: 9,
+        blocking_reason: 'certificates not in order for: acme-drive.example.com (9 day(s) left)',
+        checked_at: '2026-09-30T00:00:00+00:00',
+        checks: [
+          { hostname: 'acme.example.com', state: 'valid', ok: true, serving: true,
+            detail: '', subject: '', issuer: "Let's Encrypt", covers: [],
+            not_after: '', days_remaining: 80 },
+          { hostname: 'acme-drive.example.com', state: 'expiring', ok: false,
+            serving: true, detail: '9 day(s) left — renewal is overdue', subject: '',
+            issuer: "Let's Encrypt", covers: [], not_after: '', days_remaining: 9 },
+        ],
+      },
+    })
+
+  it('shows each subdomain its own certificate state', async () => {
+    const w = await view([withTls()])
+    const ifaces = w.findAll('tr.iface')
+    expect(ifaces[0].text()).toContain('80d')
+    expect(ifaces[1].text()).toContain('9d left')
+    expect(ifaces[1].text()).toContain('renewal is overdue')
+  })
+
+  it('colours EXPIRING amber — not green, and not red', async () => {
+    // Green would hide a fault that has a deadline; red would say the site is down when
+    // it is serving. The whole point of the state is that both are true at once.
+    const w = await view([withTls()])
+    const pills = w.findAll('tr.iface')[1].findAll('.pill')
+    const cert = pills[pills.length - 1]
+    expect(cert.classes()).toContain('warn')
+    expect(cert.classes()).not.toContain('ok')
+    expect(cert.classes()).not.toContain('bad')
+  })
+
+  it('summarises the tenant by its LEAST renewed subdomain', async () => {
+    const w = await view([withTls()])
+    expect(w.text()).toContain('renewal overdue')
+    expect(w.text()).toContain('soonest expiry 9d')
+  })
+
+  it('says a certificate served for the wrong name, rather than just failing', async () => {
+    // The failure that looks like success from the server's side: the handshake works
+    // and the browser refuses. Naming it is the difference between "TLS failed" and
+    // "you have the apex certificate on both hosts".
+    const w = await view([
+      row({
+        tenant_id: 'acme', state: 'live', admits_logins: true, may_provision: false,
+        hostnames: ['acme.example.com', 'acme-drive.example.com'],
+        tls: {
+          ok: false, serving: false, soonest_expiry_days: 80, blocking_reason: 'x',
+          checked_at: '', checks: [
+            { hostname: 'acme.example.com', state: 'valid', ok: true, serving: true,
+              detail: '', subject: '', issuer: '', covers: [], not_after: '',
+              days_remaining: 80 },
+            { hostname: 'acme-drive.example.com', state: 'wrong_host', ok: false,
+              serving: false,
+              detail: 'the certificate served is for acme.example.com, not acme-drive.example.com',
+              subject: '', issuer: '', covers: [], not_after: '', days_remaining: 80 },
+          ],
+        },
+      }),
+    ])
+    expect(w.text()).toContain('the certificate served is for acme.example.com')
+  })
+
+  it('says "not checked" rather than implying a pass', async () => {
+    const w = await view([
+      row({ tenant_id: 'acme', state: 'requested', may_provision: false,
+            hostnames: ['acme.example.com'] }),
+    ])
+    expect(w.findAll('tr.iface')[0].text()).toContain('not checked')
+  })
+
+  it('offers Verify wherever there is a domain to check', async () => {
+    const w = await view([
+      row({ tenant_id: 'acme', state: 'live', admits_logins: true, may_provision: false }),
+    ])
+    expect(w.findAll('button').some((b) => b.text() === 'Verify')).toBe(true)
+  })
+
+  it('does not offer Verify on a tenant with no recorded domain', async () => {
+    const w = await view([
+      row({ tenant_id: 'default', display_name: 'default', state: 'live',
+            admits_logins: true, may_provision: false, requested_here: false,
+            base_domain: '', address: '', records: [], hostnames: [] }),
+    ])
+    expect(w.findAll('button').some((b) => b.text() === 'Verify')).toBe(false)
+  })
+})

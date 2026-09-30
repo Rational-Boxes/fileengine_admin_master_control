@@ -183,6 +183,11 @@ def test_only_phase_one_routes_are_mounted():
         # LABEL only; tenant_id reaches four interpreters and is immutable.
         ("PUT", "/v1/tenants/{tenant_id}/display-name"),
         ("POST", "/v1/tenants/{tenant_id}/dns-check"),
+        # DNS *and* TLS on every subdomain, primary and service alike. On the observer
+        # baseline: it resolves names and opens TLS connections and changes nothing, and
+        # noticing that a certificate expires in nine days should not require the
+        # authority to provision.
+        ("POST", "/v1/tenants/{tenant_id}/verify"),
         ("POST", "/v1/tenants/{tenant_id}/dns-override"),
         ("POST", "/v1/tenants/{tenant_id}/provision"),
         # The queue the runner reads. A top-level path rather than /tenants/jobs,
@@ -228,6 +233,9 @@ def test_every_write_is_a_record_or_a_request_never_an_execution():
         # the domain is managed.
         "/v1/tenants",
         "/v1/tenants/{tenant_id}/dns-check",
+        # Writes the readings it just took. A POST because it performs work — resolving
+        # and connecting — not because it changes the tenant.
+        "/v1/tenants/{tenant_id}/verify",
         "/v1/tenants/{tenant_id}/dns-override",
         # Records a LABEL in the registry. Renames nothing that anything is keyed
         # on: the identifier is immutable.

@@ -71,6 +71,7 @@ from .registry import (
     TenantRegistry,
     schema_name_for,
 )
+from .tls import SystemTlsProbe, TlsProbe, check_tls
 from .tenants import (
     Resolver,
     StaticResolver,
@@ -174,6 +175,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
                  # near-name that reads fine and binds the wrong object.
                  tenant_registry: TenantRegistry | None = None,
                  jobs: JobStore | None = None,
+                 tls_probe: TlsProbe | None = None,
                  factors: FactorStore | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
@@ -631,6 +633,42 @@ def build_router(config: Config, registry: AdministratorRegistry,
     _resolver: Resolver = resolver if resolver is not None else StaticResolver(answers={})
 
     _interfaces = config.interface_list()
+    _tls: TlsProbe = tls_probe if tls_probe is not None else SystemTlsProbe()
+
+    def _hostnames_of(t) -> list:
+        """Every subdomain this tenant is served on, or none when unknown.
+
+        A tenant that predates this console has no recorded base domain, and one with a
+        hyphenated id is not reachable as itself — deriving hostnames for either would be
+        inventing names to then report as broken.
+        """
+        if not t.base_domain or not t.reachable_by_hostname:
+            return []
+        return hostnames_for(t.tenant_id, t.base_domain, _interfaces)
+
+    def _run_dns(t):
+        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver, _interfaces)
+        return {"ok": verdict.ok, "authoritative": verdict.authoritative,
+                "blocking_reason": verdict.blocking_reason,
+                "checks": [{"hostname": c.hostname, "ok": c.ok,
+                            "resolved": list(c.resolved), "expected": c.expected,
+                            "detail": c.detail} for c in verdict.checks]}
+
+    def _needs_hostnames(t):
+        """Refuse a check there is nothing to check, and say which it is."""
+        if not t.base_domain or not t.address:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{t.tenant_id} has no recorded base domain or address — it was "
+                       f"not requested through this console, so there is nothing to "
+                       f"check its DNS or certificates against.")
+        if not t.reachable_by_hostname:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{t.tenant_id} is an interface hostname of "
+                       f"{t.base_tenant_id}, not a tenant — the doors resolve its host "
+                       f"to {t.base_tenant_id}, so it has no subdomains of its own to "
+                       f"check.")
 
     def _records_of(t) -> list:
         """The zone lines, derived rather than stored.
@@ -646,8 +684,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
 
     def _with_records(t) -> dict:
         out = t.for_display()
-        out["hostnames"] = (hostnames_for(t.tenant_id, t.base_domain, _interfaces)
-                            if t.base_domain and t.reachable_by_hostname else [])
+        out["hostnames"] = _hostnames_of(t)
         out["records"] = _records_of(t)
         return out
 
@@ -769,37 +806,69 @@ def build_router(config: Config, registry: AdministratorRegistry,
     @r.post("/tenants/{tenant_id}/dns-check")
     def check(tenant_id: str,
               principal: Principal = Depends(require(SYSTEM_TENANTS))):
-        """Run the DNS gate.
+        """Run the DNS gate — every subdomain, primary and service alike.
 
         Asks the zone's authoritative nameservers, compares the ADDRESS rather than
-        merely that something resolves, and checks EVERY hostname. Each of those is a
-        way a green tick can be wrong, and a wrong green tick here burns certificate
-        issuance for the whole domain.
+        merely that something resolves, and checks EVERY hostname. Each of those is a way
+        a green tick can be wrong, and a wrong green tick here burns certificate issuance
+        for the whole domain.
+
+        DNS only, and fast: this is the input to the provisioning gate, and it is the one
+        that gets pressed repeatedly while waiting for propagation. `verify` below does
+        this and the certificates together.
         """
         t = _must_get(tenant_id)
-        if not t.base_domain or not t.address:
-            # A tenant that predates this console has no recorded domain or address,
-            # so there is nothing to check it against. Said plainly rather than
-            # checked against empty strings and reported as a DNS failure.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"{tenant_id} has no recorded base domain or address — it was "
-                       f"not requested through this console, so there is nothing to "
-                       f"check its DNS against.")
-        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver, _interfaces)
+        _needs_hostnames(t)
+        dns = _run_dns(t)
         try:
-            t = _registry.record_dns(tenant_id, {
-                "ok": verdict.ok, "authoritative": verdict.authoritative,
-                "blocking_reason": verdict.blocking_reason,
-                "checks": [{"hostname": c.hostname, "ok": c.ok,
-                            "resolved": list(c.resolved), "expected": c.expected,
-                            "detail": c.detail} for c in verdict.checks],
-            })
+            t = _registry.record_dns(tenant_id, dns)
         except RegistryUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail=str(e)) from e
         log.info("tenant %s DNS check: %s", tenant_id,
-                 "passed" if verdict.ok else verdict.blocking_reason)
+                 "passed" if dns["ok"] else dns["blocking_reason"])
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/verify")
+    def verify(tenant_id: str,
+               principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """Is this tenant actually live? DNS **and** TLS, on every subdomain.
+
+        The two halves answer different questions and a tenant needs both to work:
+
+          * DNS — does each name resolve, authoritatively, to the right address.
+          * TLS — is each name serving a trusted certificate that covers it, and for
+            how much longer.
+
+        Every subdomain separately, because every one has its own record and its own
+        certificate. A tenant whose primary host is fine and whose `-drive` host expired
+        is one whose WebDAV stopped while its web interface kept serving, and a single
+        verdict cannot say that.
+
+        Gated on the OBSERVER baseline, not system_tenants: this is a read. It resolves
+        names and opens TLS connections and changes nothing about the tenant — and
+        noticing that a certificate expires in nine days should not require the authority
+        to provision.
+
+        THE CERTIFICATE RESULT DOES NOT FEED THE PROVISIONING GATE. No certificate exists
+        before provisioning, so requiring one would make the gate unpassable; `absent` is
+        the expected answer for a tenant being created and is not reported as a fault.
+        """
+        t = _must_get(tenant_id)
+        _needs_hostnames(t)
+        hosts = _hostnames_of(t)
+
+        dns = _run_dns(t)
+        tls = check_tls(hosts, _tls).as_dict()
+        try:
+            _registry.record_dns(tenant_id, dns)
+            t = _registry.record_tls(tenant_id, tls)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s verify: dns=%s tls=%s", tenant_id,
+                 "ok" if dns["ok"] else "not ready",
+                 "ok" if tls["ok"] else (tls["blocking_reason"] or "not ready"))
         return _with_records(t)
 
     @r.post("/tenants/{tenant_id}/dns-override")

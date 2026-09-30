@@ -136,6 +136,7 @@ class Tenant:
     initial_admin: str = ""
     requested_by: str = ""
     dns: Optional[dict] = None
+    tls: Optional[dict] = None
     override_by: str = ""
     override_reason: str = ""
     job_id: str = ""
@@ -214,6 +215,8 @@ class Tenant:
         }
         if self.dns:
             out["dns"] = self.dns
+        if self.tls:
+            out["tls"] = self.tls
         if self.override_by:
             out["override"] = {"by": self.override_by, "reason": self.override_reason}
         if self.job_id:
@@ -233,6 +236,7 @@ class TenantRegistry(Protocol):
                 display_name: str = "") -> Tenant: ...
     def set_display_name(self, tenant_id: str, name: str) -> Optional[Tenant]: ...
     def record_dns(self, tenant_id: str, verdict: dict) -> Optional[Tenant]: ...
+    def record_tls(self, tenant_id: str, verdict: dict) -> Optional[Tenant]: ...
     def record_override(self, tenant_id: str, by: str, reason: str) -> Optional[Tenant]: ...
     def claim_for_provisioning(self, tenant_id: str, by: str) -> Optional[Tenant]: ...
     def attach_job(self, tenant_id: str, job_id: str) -> None: ...
@@ -267,6 +271,12 @@ _ADDED = (
     # The DNS verdict: a nested per-hostname reading, displayed whole and never
     # queried by its parts, except for `ok` in the gate predicate.
     ("dns", "jsonb"),
+    # The certificate state per hostname, from the last check. SEPARATE from `dns`
+    # because they answer different questions at different times: DNS decides whether
+    # issuance will work, and this reports whether it did and whether it still does.
+    # It deliberately does NOT feed the provisioning gate — no certificate exists before
+    # provisioning, so requiring one would make the gate unpassable.
+    ("tls", "jsonb"),
     ("override_by", "text NOT NULL DEFAULT ''"),
     ("override_reason", "text NOT NULL DEFAULT ''"),
     ("job_id", "text NOT NULL DEFAULT ''"),
@@ -282,27 +292,29 @@ _DDL_LOCK = 0x7E9A_47C2
 
 _COLS = ("tenant_id, schema_name, state, display_name, created_at, state_since, "
          "state_by, state_note, base_domain, address, initial_admin, requested_by, "
-         "dns, override_by, override_reason, job_id, failed_step, failure_detail, "
-         "retry_safe")
+         "dns, tls, override_by, override_reason, job_id, failed_step, "
+         "failure_detail, retry_safe")
 
 #: The gate, in SQL. Mirrored by Tenant.gate_cleared, and a test asserts they agree.
 _GATE = "(override_by <> '' OR (dns->>'ok') = 'true')"
 
 
 def _row(r) -> Tenant:
-    dns = r[12]
+    dns, tls = r[12], r[13]
     if isinstance(dns, str):
         dns = json.loads(dns)
+    if isinstance(tls, str):
+        tls = json.loads(tls)
     return Tenant(
         tenant_id=str(r[0]), schema_name=str(r[1] or ""), state=str(r[2] or ""),
         display_name=str(r[3] or ""), created_at=str(r[4] or ""),
         state_since=str(r[5] or ""), state_by=str(r[6] or ""),
         state_note=str(r[7] or ""), base_domain=str(r[8] or ""),
         address=str(r[9] or ""), initial_admin=str(r[10] or ""),
-        requested_by=str(r[11] or ""), dns=dns,
-        override_by=str(r[13] or ""), override_reason=str(r[14] or ""),
-        job_id=str(r[15] or ""), failed_step=str(r[16] or ""),
-        failure_detail=str(r[17] or ""), retry_safe=bool(r[18]),
+        requested_by=str(r[11] or ""), dns=dns, tls=tls,
+        override_by=str(r[14] or ""), override_reason=str(r[15] or ""),
+        job_id=str(r[16] or ""), failed_step=str(r[17] or ""),
+        failure_detail=str(r[18] or ""), retry_safe=bool(r[19]),
     )
 
 
@@ -413,6 +425,23 @@ class PostgresTenantRegistry:
                     f"ELSE state_since END "
                     f"WHERE tenant_id = %s RETURNING {_COLS}",
                     (json.dumps(verdict), CLAIMABLE, AWAITING_DNS, CLAIMABLE, tenant_id))
+                row = cur.fetchone()
+            conn.commit()
+        return _row(row) if row else None
+
+    def record_tls(self, tenant_id: str, verdict: dict) -> Optional[Tenant]:
+        """Store the certificate verdict. NEVER touches the state.
+
+        A certificate is not a lifecycle fact. An expired one on a live tenant is a
+        serious problem and the tenant is still live — moving it out of `live` would take
+        the site down to report that its certificate is about to, which is worse than
+        the fault.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE public.tenants SET tls = %s, updated_at = now() "
+                            f"WHERE tenant_id = %s RETURNING {_COLS}",
+                            (json.dumps(verdict), tenant_id))
                 row = cur.fetchone()
             conn.commit()
         return _row(row) if row else None
@@ -531,6 +560,12 @@ class StaticTenantRegistry:
             return None
         state = AWAITING_DNS if t.state in CLAIMABLE else t.state
         return self._replace(tenant_id, dns=verdict, state=state)
+
+    def record_tls(self, tenant_id: str, verdict: dict) -> Optional[Tenant]:
+        self._guard()
+        if tenant_id not in self.rows:
+            return None
+        return self._replace(tenant_id, tls=verdict)
 
     def record_override(self, tenant_id: str, by: str, reason: str) -> Optional[Tenant]:
         self._guard()

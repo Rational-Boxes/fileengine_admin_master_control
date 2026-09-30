@@ -80,6 +80,32 @@ export const auth = {
 
 // ── tenants (§3.4a) ────────────────────────────────────────────────────────
 
+/** One subdomain's certificate. `ok` is false for `expiring` — see `serving`. */
+export interface CertCheck {
+  hostname: string
+  state: 'valid' | 'expiring' | 'expired' | 'wrong_host' | 'untrusted' | 'absent'
+    | 'unreachable'
+  /** Trusted, covers the host, and comfortably in date. `expiring` is NOT ok. */
+  ok: boolean
+  /** Working right now, whatever happens next — true for `expiring` too. */
+  serving: boolean
+  detail: string
+  subject: string
+  issuer: string
+  covers: string[]
+  not_after: string
+  days_remaining: number | null
+}
+
+export interface TlsVerdict {
+  ok: boolean
+  serving: boolean
+  soonest_expiry_days: number | null
+  blocking_reason: string
+  checked_at: string
+  checks: CertCheck[]
+}
+
 export interface DnsCheck {
   hostname: string
   ok: boolean
@@ -126,6 +152,7 @@ export interface TenantView {
   hostnames: string[]
   records: { name: string; type: string; value: string; zone_line: string }[]
   dns?: { ok: boolean; authoritative: boolean; blocking_reason: string; checks: DnsCheck[] }
+  tls?: TlsVerdict
   override?: { by: string; reason: string }
   failure?: { step: string; detail: string; retry_safe: boolean }
   job_id?: string
@@ -158,6 +185,11 @@ export const tenants = {
   },
   async dnsCheck(id: string) {
     const r = await http.post<TenantView>(`/v1/tenants/${encodeURIComponent(id)}/dns-check`)
+    return r.data
+  },
+  /** DNS **and** TLS, on every subdomain. The "is this actually live" operation. */
+  async verify(id: string) {
+    const r = await http.post<TenantView>(`/v1/tenants/${encodeURIComponent(id)}/verify`)
     return r.data
   },
   async dnsOverride(id: string, reason: string) {
