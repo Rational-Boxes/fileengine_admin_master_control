@@ -73,6 +73,25 @@ class AuthError(Exception):
         self.status_code = status_code
 
 
+class DirectoryUnavailable(AuthError):
+    """The directory could not be ASKED — as distinct from having answered "no".
+
+    The two are opposite operator responses and they were indistinguishable at
+    first, because a failed search returned an empty role set. That is the same
+    mistake the tenant-state gate was written to avoid: "a failed lookup must not
+    claim a suspension". Here it claimed something narrower and more misleading —
+    that a named administrator holds no deployment role — about a directory that
+    in fact lists them in all five groups.
+
+    Still FAILS CLOSED: this is an AuthError, so nothing is authorised on it. The
+    difference is only in what it says, and 503 rather than 403 says "come back"
+    rather than "you have no authority here".
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
 @dataclass(frozen=True)
 class Principal:
     """An authenticated administrator and the authority they hold."""
@@ -165,13 +184,34 @@ class LdapDeploymentDirectory:
         try:
             conn = self._connect(self.bind_dn, self.bind_password)
         except Exception as e:  # noqa: BLE001
+            # RAISES rather than returning an empty set. An empty set means "this
+            # administrator holds no deployment role", which is a true and
+            # actionable statement; it must not also mean "the directory did not
+            # answer". See DirectoryUnavailable.
             log.warning("directory unreachable resolving roles for %s: %s", subject, e)
-            return frozenset()
+            raise DirectoryUnavailable(
+                f"the deployment directory could not be reached: {e}") from e
         try:
             # SUBTREE of the deployment OU ONLY. Never base_dn, never a tenant OU.
-            conn.search(self.role_base,
-                        f"(&(objectClass=groupOfNames)(member={dn}))",
-                        search_scope=ldap3.SUBTREE, attributes=["cn"])
+            ok = conn.search(self.role_base,
+                             f"(&(objectClass=groupOfNames)(member={dn}))",
+                             search_scope=ldap3.SUBTREE, attributes=["cn"])
+            if not ok:
+                # The search itself failed — the commonest cause is exactly the one
+                # that bit here: an ANONYMOUS or under-privileged bind against a
+                # directory that hides the role OU. OpenLDAP answers `noSuchObject`
+                # for a subtree the client may not see, so "the OU is missing" and
+                # "you may not read it" arrive identically and neither is "this
+                # user has no roles".
+                result = getattr(conn, "result", None) or {}
+                desc = result.get("description") or result.get("result") or "unknown"
+                log.error("role search under %s failed (%s) — bound as %r. A directory "
+                          "that hides the role OU returns nothing to an anonymous "
+                          "client; set AMC_LDAP_BIND_DN / AMC_LDAP_BIND_PASSWORD.",
+                          self.role_base, desc, self.bind_dn or "<anonymous>")
+                raise DirectoryUnavailable(
+                    f"the deployment role OU {self.role_base} could not be searched "
+                    f"({desc})")
             found = set()
             for entry in conn.entries:
                 cn = str(entry.cn.value) if entry.cn else ""
@@ -377,6 +417,12 @@ def directory_has_owner(directory: DeploymentDirectory, candidates: Iterable[str
     owner we can name", not "an owner exists" — and the difference is why a
     directory-only owner nobody has recorded still shows as drift rather than
     being silently relied upon.
+
+    Propagates :class:`DirectoryUnavailable` rather than answering False. "No
+    owner" and "could not read the role OU" need different operator responses —
+    the first is a provisioning gap, the second a bind credential — and readiness
+    reported the first about a directory containing an owner until they were
+    separated.
     """
     for subject in candidates:
         if SYSTEM_OWNER in directory.roles_of(subject):

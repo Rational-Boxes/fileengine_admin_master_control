@@ -48,6 +48,16 @@ from .auth import (
 )
 from .config import Config
 from .redactions import ErasureSource, register as redaction_register
+from .tenants import (
+    Resolver,
+    StaticResolver,
+    TenantError,
+    TenantRequest,
+    override as dns_override,
+    provisioning_job,
+    records_for,
+    verify as dns_verify,
+)
 from .incidents import (
     IncidentSource,
     LedgerUnavailable,
@@ -61,6 +71,7 @@ from .roles import (
     SYSTEM_OBSERVER,
     SYSTEM_OWNER,
     SYSTEM_SECURITY,
+    SYSTEM_TENANTS,
     RoleError,
 )
 
@@ -71,6 +82,17 @@ class LoginRequest(BaseModel):
     subject: str
     password: str
     second_factor: Optional[str] = None
+
+
+class TenantRequestBody(BaseModel):
+    tenant_id: str
+    base_domain: str
+    address: str
+    initial_admin: str
+
+
+class OverrideBody(BaseModel):
+    reason: str
 
 
 class GrantRequest(BaseModel):
@@ -98,7 +120,10 @@ class TransitionRequest(BaseModel):
 def build_router(config: Config, registry: AdministratorRegistry,
                  directory: DeploymentDirectory,
                  incidents: IncidentSource | None = None,
-                 erasures: ErasureSource | None = None) -> APIRouter:
+                 erasures: ErasureSource | None = None,
+                 resolver: Resolver | None = None,
+                 tenant_requests: dict | None = None,
+                 jobs: list | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
 
@@ -402,5 +427,136 @@ def build_router(config: Config, registry: AdministratorRegistry,
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                     detail="queue state unavailable") from e
         return redaction_register(erasures, states)
+
+    # ── tenant setup and management (§3.4a) ────────────────────────────────
+    #
+    # THIS APPLICATION NEVER TOUCHES DNS AND NEVER RUNS ANSIBLE. DNS is managed
+    # wherever the domain is, by a human — so there is no DNS credential here
+    # because there is no DNS operation. And the playbook is executed by a runner
+    # on the host that holds the vault password; these routes write a JOB (§5.3).
+
+    _requests: dict = tenant_requests if tenant_requests is not None else {}
+    _jobs: list = jobs if jobs is not None else []
+    _resolver: Resolver = resolver if resolver is not None else StaticResolver(answers={})
+
+    @r.post("/tenants", status_code=status.HTTP_201_CREATED)
+    def request_tenant(body: TenantRequestBody,
+                       principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Request a tenant, and return exactly the DNS records to create.
+
+        Step 1 of §3.4a. The response is meant for pasting into a zone file — the
+        administrator then updates the zone wherever the domain is managed, and
+        the gate below is what decides when provisioning may run.
+        """
+        principal.authorising(SYSTEM_TENANTS)
+        if body.tenant_id in _requests:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail=f"{body.tenant_id} is already requested")
+        try:
+            req = TenantRequest(tenant_id=body.tenant_id, base_domain=body.base_domain,
+                                address=body.address, initial_admin=body.initial_admin,
+                                requested_by=principal.subject)
+        except TenantError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        _requests[req.tenant_id] = req
+        log.info("tenant %s requested by %s", req.tenant_id, principal.subject)
+        return req.for_display()
+
+    @r.get("/tenants")
+    def list_requests(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """Every in-flight request and its state.
+
+        Readable by the observer baseline: a tenant part-way through creation is
+        the outstanding thing §3.2 exists for, and knowing one is stuck needs no
+        authority to change it.
+        """
+        return {"tenants": [t.for_display() for t in _requests.values()]}
+
+    @r.get("/tenants/{tenant_id}")
+    def get_request(tenant_id: str,
+                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        req = _requests.get(tenant_id)
+        if req is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        return req.for_display()
+
+    @r.post("/tenants/{tenant_id}/dns-check")
+    def check(tenant_id: str,
+              principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Run the DNS gate.
+
+        Asks the zone's authoritative nameservers, compares the ADDRESS rather
+        than merely that something resolves, and checks EVERY hostname. Each of
+        those is a way a green tick can be wrong, and a wrong green tick here
+        burns certificate issuance for the whole domain.
+        """
+        req = _requests.get(tenant_id)
+        if req is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        dns_verify(req, _resolver)
+        return req.for_display()
+
+    @r.post("/tenants/{tenant_id}/dns-override")
+    def do_override(tenant_id: str, body: OverrideBody,
+                    principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Force past the DNS gate, recorded.
+
+        There are legitimate reasons the check fails on a correct setup —
+        split-horizon DNS, a CDN in front, a zone the administrator does not
+        control but has been told is ready. This is the one path to provisioning
+        that can exhaust certificate issuance for every tenant on the domain,
+        which is why it takes a reason and keeps a name attached rather than
+        being a retry button.
+        """
+        authorised_as = principal.authorising(SYSTEM_TENANTS)
+        req = _requests.get(tenant_id)
+        if req is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        try:
+            dns_override(req, by=principal.subject, reason=body.reason)
+        except TenantError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        log.warning("tenant %s DNS gate overridden by %s (as %s): %s",
+                    tenant_id, principal.subject, authorised_as, body.reason)
+        return req.for_display()
+
+    @r.post("/tenants/{tenant_id}/provision", status_code=status.HTTP_202_ACCEPTED)
+    def provision(tenant_id: str,
+                  principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Write the provisioning job for the runner to claim.
+
+        202, not 200: this application has ASKED. A playbook is minutes and an
+        HTTP request is not, so the work is a job with state, and the runner —
+        which holds the credentials this application deliberately does not —
+        claims it, executes one at a time, and reports back.
+        """
+        authorised_as = principal.authorising(SYSTEM_TENANTS)
+        req = _requests.get(tenant_id)
+        if req is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        try:
+            job = provisioning_job(req, requested_by=principal.subject)
+        except TenantError as e:
+            # 409, not 400: the request is well-formed, the SEQUENCE is wrong. The
+            # gate has not passed and has not been overridden.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+        job["authorised_as"] = authorised_as
+        _jobs.append(job)
+        req.state = "provisioning"
+        req.job_id = f"job-{len(_jobs)}"
+        job["job_id"] = req.job_id
+        log.info("tenant %s provisioning job written by %s", tenant_id, principal.subject)
+        return {"job": job, "tenant": req.for_display()}
+
+    @r.get("/tenants/{tenant_id}/records")
+    def dns_records(tenant_id: str,
+                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """The records to create, on their own, for pasting into a zone."""
+        req = _requests.get(tenant_id)
+        if req is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        return {"tenant_id": tenant_id,
+                "records": [{"name": rec.name, "type": rec.type, "value": rec.value,
+                             "zone_line": rec.as_zone_line()} for rec in req.records]}
 
     return r

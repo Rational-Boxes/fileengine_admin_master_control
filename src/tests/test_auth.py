@@ -38,6 +38,7 @@ from admin_master_control.administrators import AdministratorRegistry, bootstrap
 from admin_master_control.app import build_app
 from admin_master_control.auth import (
     AuthError,
+    DirectoryUnavailable,
     Principal,
     StaticDeploymentDirectory,
     login,
@@ -340,3 +341,109 @@ def test_history_is_readable_and_records_revocations():
     body = h.json()
     assert len(body["history"]) == 5          # the five bootstrap grants
     assert all(e["granted_by"] == "provisioning" for e in body["history"])
+
+
+# ── "could not ask" is not "answered no" ───────────────────────────────────
+#
+# Found by running the app against the real dev directory rather than a fixture.
+# The role search bound ANONYMOUSLY (there was no configuration path for a bind
+# credential at all), OpenLDAP answers `noSuchObject` for ou=system to an
+# anonymous client, and the empty result was read as "this administrator holds no
+# deployment role". So the console authenticated the owner and then refused them,
+# and /readyz reported "no system_owner in the directory" about a directory
+# listing them in all five groups.
+#
+# Failing closed was right. Being unable to say WHY was the defect: a missing
+# owner is a provisioning gap and an unreadable role OU is a bind credential, and
+# nothing in the output told them apart.
+
+
+class _Unreachable:
+    """A directory that cannot be asked."""
+
+    def authenticate(self, subject, password):
+        return True
+
+    def roles_of(self, subject):
+        raise DirectoryUnavailable("the deployment role OU could not be searched")
+
+
+class _NoRoles:
+    """A directory that answers, and answers none."""
+
+    def authenticate(self, subject, password):
+        return True
+
+    def roles_of(self, subject):
+        return frozenset()
+
+
+def test_an_unreadable_directory_is_not_reported_as_no_roles():
+    with pytest.raises(DirectoryUnavailable):
+        login(_cfg(), _Unreachable(), "james@rationalboxes.com", "pw",
+              second_factor="totp")
+
+
+def test_an_unreadable_directory_says_come_back_not_you_have_no_authority():
+    # 503, not 403. The distinction is the whole point: 403 tells an
+    # administrator they hold no authority, which sends them to the directory to
+    # fix something that is not broken.
+    try:
+        login(_cfg(), _Unreachable(), "james@rationalboxes.com", "pw",
+              second_factor="totp")
+    except DirectoryUnavailable as e:
+        assert e.status_code == 503
+        assert "could not be searched" in e.reason
+        assert "no deployment role" not in e.reason
+
+
+def test_a_directory_that_answers_none_still_refuses_with_403():
+    # The other side of the pair — this message IS the right one here.
+    with pytest.raises(AuthError) as e:
+        login(_cfg(), _NoRoles(), "nobody@rationalboxes.com", "pw",
+              second_factor="totp")
+    assert e.value.status_code == 403
+    assert "no deployment role" in e.value.reason
+    assert not isinstance(e.value, DirectoryUnavailable)
+
+
+def test_an_unreadable_directory_still_authorises_nothing():
+    # It fails CLOSED. DirectoryUnavailable is an AuthError precisely so that a
+    # caller which only catches AuthError cannot accidentally treat it as a pass.
+    assert issubclass(DirectoryUnavailable, AuthError)
+
+
+def test_readiness_distinguishes_no_owner_from_an_unreadable_directory():
+    from admin_master_control.app import build_monitoring
+    from fastapi.testclient import TestClient
+
+    c = _cfg()
+    c.audit_url = "http://audit:8097"
+    c.bootstrap_owner = "james@rationalboxes.com"
+
+    unreadable = TestClient(build_monitoring(c, AdministratorRegistry(), _Unreachable()))
+    problems = unreadable.get("/readyz").json()["problems"]
+    assert any("could not be read" in p for p in problems)
+    assert not any("no system_owner" in p for p in problems), (
+        "an unreadable directory must not be reported as a missing owner")
+
+    empty = TestClient(build_monitoring(c, AdministratorRegistry(), _NoRoles()))
+    problems = empty.get("/readyz").json()["problems"]
+    assert any("no system_owner" in p for p in problems)
+
+
+def test_the_bind_credential_reaches_the_directory():
+    # There was no configuration path for this at all, so the search bound
+    # anonymously. A field with no way to set it is a default that only works
+    # against a directory allowing anonymous reads of its role OU.
+    from admin_master_control.app import default_directory
+
+    c = _cfg()
+    c.ldap_url = "ldap://localhost:1389"
+    c.ldap_base_dn = "dc=rationalboxes,dc=com"
+    c.ldap_bind_dn = "cn=reader,dc=rationalboxes,dc=com"
+    c.ldap_bind_password = "secret"
+    d = default_directory(c)
+    assert d.bind_dn == "cn=reader,dc=rationalboxes,dc=com"
+    assert d.bind_password == "secret"
+    assert d.role_base == "ou=system,dc=rationalboxes,dc=com"

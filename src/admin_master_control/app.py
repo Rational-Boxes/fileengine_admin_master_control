@@ -34,8 +34,10 @@ from .administrators import AdministratorRegistry, bootstrap_owner, summarise
 from .api import build_router
 from .incidents import IncidentSource, from_config as incidents_from_config
 from .redactions import ErasureSource, StaticErasures
+from .tenants import Resolver, SystemResolver
 from .auth import (
     DeploymentDirectory,
+    DirectoryUnavailable,
     LdapDeploymentDirectory,
     StaticDeploymentDirectory,
     directory_has_owner,
@@ -55,6 +57,8 @@ def default_directory(config: Config) -> DeploymentDirectory:
     """
     if config.ldap_url and config.ldap_base_dn:
         return LdapDeploymentDirectory(url=config.ldap_url, base_dn=config.ldap_base_dn,
+                                       bind_dn=config.ldap_bind_dn,
+                                       bind_password=config.ldap_bind_password,
                                        role_ou=config.ldap_role_ou,
                                        user_ou=config.ldap_user_ou)
     log.warning("no directory configured — every login will be refused")
@@ -65,7 +69,8 @@ def build_app(config: Config,
               registry: AdministratorRegistry | None = None,
               directory: DeploymentDirectory | None = None,
               incidents: IncidentSource | None = None,
-              erasures: ErasureSource | None = None) -> FastAPI:
+              erasures: ErasureSource | None = None,
+              resolver: Resolver | None = None) -> FastAPI:
     """The API. Pure: takes its config, reads no environment, loads no dotenv —
     so a test can construct one without a deployment underneath it.
 
@@ -85,6 +90,13 @@ def build_app(config: Config,
     # honest (there are no items it can see) where a 503 would say the feature is
     # broken.
     app.state.erasures = erasures if erasures is not None else StaticErasures()
+    # The LOCAL resolver, which reports itself as non-authoritative — so the DNS
+    # gate will not pass on its word and an administrator must use the recorded
+    # override. That is deliberate: a local lookup masquerading as proof is how a
+    # premature run burns the domain's certificate rate limit.
+    app.state.resolver = resolver if resolver is not None else SystemResolver()
+    app.state.tenant_requests = {}
+    app.state.provisioning_jobs = []
     apply_bootstrap(config, app.state.registry)
 
     # PHASE 1 (§8.1): read-only, plus the door in front of it and the grant
@@ -97,7 +109,9 @@ def build_app(config: Config,
     # They are absent rather than stubbed. A route that exists and returns 501
     # is a route somebody will wire up.
     app.include_router(build_router(config, app.state.registry, app.state.directory,
-                                    app.state.incidents, app.state.erasures))
+                                    app.state.incidents, app.state.erasures,
+                                    app.state.resolver, app.state.tenant_requests,
+                                    app.state.provisioning_jobs))
     return app
 
 
@@ -169,11 +183,24 @@ def build_monitoring(config: Config,
         known = set(registry.subjects())
         if config.bootstrap_owner:
             known.add(config.bootstrap_owner)
-        if not directory_has_owner(directory, known):
-            # system_owner is the only role that creates authority, so a
-            # deployment without one cannot grant anything to anybody. It is not
-            # degraded, it is stranded, and the only way out is the directory.
-            problems.append("no system_owner in the directory — nobody can grant authority (§6.3)")
+        try:
+            has_owner = directory_has_owner(directory, known)
+        except DirectoryUnavailable as e:
+            # NOT "no owner". The directory could not be asked, and the two need
+            # opposite responses: a missing owner is a provisioning gap, while an
+            # unreadable role OU is a bind credential. This reported the former
+            # about a directory containing an owner in all five groups, because
+            # the role search bound anonymously and OpenLDAP hides ou=system from
+            # an anonymous client.
+            problems.append(f"the deployment directory could not be read: {e.reason}")
+        else:
+            if not has_owner:
+                # system_owner is the only role that creates authority, so a
+                # deployment without one cannot grant anything to anybody. It is
+                # not degraded, it is stranded, and the only way out is the
+                # directory.
+                problems.append(
+                    "no system_owner in the directory — nobody can grant authority (§6.3)")
 
         if problems:
             return JSONResponse({"status": "not-ready", "problems": problems}, status_code=503)

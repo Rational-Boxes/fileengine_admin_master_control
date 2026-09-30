@@ -159,19 +159,83 @@ def test_only_phase_one_routes_are_mounted():
         ("POST", "/v1/security/queue/transition"),
         # §3.3.2, the redaction register. Read-only, and names the file by uuid.
         ("GET", "/v1/redactions"),
+        # §3.4a, tenant setup. The three POSTs beyond the request are the DNS
+        # gate, the recorded override of it, and the job hand-off — reviewed
+        # below, because they are the first routes in this application whose
+        # effect leaves it.
+        ("POST", "/v1/tenants"),
+        ("GET", "/v1/tenants"),
+        ("GET", "/v1/tenants/{tenant_id}"),
+        ("GET", "/v1/tenants/{tenant_id}/records"),
+        ("POST", "/v1/tenants/{tenant_id}/dns-check"),
+        ("POST", "/v1/tenants/{tenant_id}/dns-override"),
+        ("POST", "/v1/tenants/{tenant_id}/provision"),
     }
 
 
-def test_phase_one_writes_nothing_outside_its_own_ledger():
-    # §8.1: "No writes, no decisions, no destructive capability." The two POSTs
-    # beyond the login touch this application's own grant ledger and nothing
-    # else. Anything reaching a tenant, a bucket or a playbook belongs to a
-    # later phase and a separate review.
+def test_every_write_is_a_record_or_a_request_never_an_execution():
+    # This was `test_phase_one_writes_nothing_outside_its_own_ledger`, and the
+    # rename is the honest part: with §3.4a that assertion is no longer TRUE.
+    # `/v1/tenants/{id}/provision` writes a job that a runner will execute, and
+    # a playbook run reaches a real DNS zone, a real certificate authority and a
+    # real database. Widening the old list and keeping its name would have left a
+    # test claiming a property the application had stopped having.
+    #
+    # The property that survives — and the one §5.3 actually asks for — is that
+    # every write here is a RECORD of a decision or a REQUEST for work, never the
+    # work. This application holds no vault password, no DNS credential and no
+    # Ansible inventory, so there is nothing it could execute even if a route
+    # tried.
     from admin_master_control.app import build_app
     writes = {path for method, path in _served(build_app(_cfg(), _owned()))
               if method in {"POST", "PUT", "PATCH", "DELETE"}}
-    assert writes == {"/v1/auth/token", "/v1/grants", "/v1/revocations",
-                      # Writes a DECISION to audit_service's queue. It executes
-                      # nothing: an approved redaction is carried out by the
-                      # cloud-B application, behind its own human step.
-                      "/v1/security/queue/transition"}
+    assert writes == {
+        "/v1/auth/token",
+        # Records, in this application's own append-only ledger.
+        "/v1/grants",
+        "/v1/revocations",
+        # Records a DECISION in audit_service's queue. Executes nothing: an
+        # approved redaction is carried out by the cloud-B application, behind
+        # its own human step.
+        "/v1/security/queue/transition",
+        # Records a request and the state of its DNS gate. No effect outside this
+        # application: the administrator creates the records by hand, wherever
+        # the domain is managed.
+        "/v1/tenants",
+        "/v1/tenants/{tenant_id}/dns-check",
+        "/v1/tenants/{tenant_id}/dns-override",
+        # REQUESTS work. The one route whose effect leaves this application, and
+        # it leaves as a queued job for a runner that holds the credentials this
+        # application deliberately does not.
+        "/v1/tenants/{tenant_id}/provision",
+    }
+
+
+def test_nothing_here_can_destroy_a_tenant():
+    # §8.1's "no destructive capability", kept as its own assertion now that
+    # tenant routes exist. §3.4b decommissioning is phase 4 and behind
+    # re-authentication; until it is reviewed, no DELETE may exist at all, and
+    # no route may spell suspension or decommissioning.
+    from admin_master_control.app import build_app
+    served = _served(build_app(_cfg(), _owned()))
+    assert not [p for m, p in served if m == "DELETE"], "no DELETE has been reviewed"
+    for _, path in served:
+        for forbidden in ("decommission", "suspend", "destroy", "purge"):
+            assert forbidden not in path, f"{path} needs its own §3.4b review"
+
+
+def test_no_route_can_execute_a_playbook_because_nothing_here_can():
+    # The structural half of the claim above: grep the package for the tools that
+    # would be needed to run the work rather than request it. A route that tried
+    # would have to import one of these, and this fails before it can be written.
+    import pathlib
+
+    import admin_master_control
+    pkg = pathlib.Path(admin_master_control.__file__).parent
+    for src in pkg.rglob("*.py"):
+        text = src.read_text()
+        for tool in ("ansible-playbook", "subprocess", "os.system", "pexpect",
+                     "vault_password", "certbot"):
+            assert tool not in text, (
+                f"{src.name} references {tool!r}: provisioning is REQUESTED here "
+                f"and executed by the runner (§5.3)")

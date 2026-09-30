@@ -76,6 +76,27 @@ class Config:
     # ── Authentication (§6) ────────────────────────────────────────────────
     ldap_url: str = field(default_factory=lambda: _env("FILEENGINE_LDAP_URL", ""))
     ldap_base_dn: str = field(default_factory=lambda: _env("FILEENGINE_LDAP_BASE_DN", ""))
+    # The credential this application READS THE ROLE OU WITH. Distinct from the
+    # administrator's own bind, which authenticates them: resolving "which
+    # deployment roles does this subject hold" is a search, and a directory that
+    # hides ou=system from anonymous clients — which is every sensibly configured
+    # one — returns nothing to an unbound search.
+    #
+    # There was no way to set this at first, so the search bound anonymously. The
+    # dev directory answers "No such object" for ou=system to an anonymous client,
+    # so every lookup came back empty, which is indistinguishable from "this
+    # administrator holds no deployment role". The result was a console that
+    # authenticated the owner correctly and then refused them, and a /readyz that
+    # reported "no system_owner in the directory" about a directory containing
+    # one. Failing closed was right; being unable to say why was not.
+    #
+    # A read-only account is sufficient and correct — this application never
+    # writes to the directory. Grants are recorded in its own ledger, and
+    # directory membership is changed by directory administration.
+    ldap_bind_dn: str = field(default_factory=lambda: _env(
+        "AMC_LDAP_BIND_DN", _env("FILEENGINE_LDAP_BIND_DN", "")))
+    ldap_bind_password: str = field(default_factory=lambda: _env(
+        "AMC_LDAP_BIND_PASSWORD", _env("FILEENGINE_LDAP_BIND_PASSWORD", "")))
     # Deployment roles live OUTSIDE every tenant OU. The shared prefix is what
     # makes "refuse these in tenant context" one rule rather than a list that
     # drifts as roles are added — see DEPLOYMENT_MANAGEMENT_INTERFACE.md §6.2.
