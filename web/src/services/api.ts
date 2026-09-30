@@ -90,16 +90,35 @@ export interface DnsCheck {
 
 export interface TenantView {
   tenant_id: string
+  /** The human-readable name, for billing and high-level operations.
+   *
+   * Falls back to `tenant_id` server-side so there is always something to print —
+   * but it is NEVER an identifier. Anything that looks a tenant up uses
+   * `tenant_id`, which is immutable because it reaches a hostname, a Postgres
+   * schema, an LDAP DN and a file path.
+   */
+  display_name: string
+  has_display_name: boolean
+  schema_name: string
+  /** The REGISTRY's lifecycle state — the same value the doors compare against. */
   state: string
+  /** Whether a login is admitted, which is `state === 'live'` and nothing else. */
+  admits_logins: boolean
+  /** THE SERVER'S JUDGEMENT on the DNS gate. Never recomputed here. */
+  may_provision: boolean
+  gate_cleared: boolean
+  /** False for every tenant that predates this console — the normal case. */
+  requested_here: boolean
+  created_at: string
+  state_since: string
+  state_by: string
+  state_note: string
   base_domain: string
   address: string
   initial_admin: string
   requested_by: string
-  requested_at: string
   hostnames: string[]
   records: { name: string; type: string; value: string; zone_line: string }[]
-  /** THE SERVER'S JUDGEMENT. Never recomputed here — see TenantsView. */
-  may_provision: boolean
   dns?: { ok: boolean; authoritative: boolean; blocking_reason: string; checks: DnsCheck[] }
   override?: { by: string; reason: string }
   failure?: { step: string; detail: string; retry_safe: boolean }
@@ -120,8 +139,15 @@ export const tenants = {
     base_domain: string
     address: string
     initial_admin: string
+    display_name?: string
   }) {
     const r = await http.post<TenantView>('/v1/tenants', body)
+    return r.data
+  },
+  /** Rename the LABEL. Never the identifier. */
+  async setDisplayName(id: string, display_name: string) {
+    const r = await http.put<TenantView>(
+      `/v1/tenants/${encodeURIComponent(id)}/display-name`, { display_name })
     return r.data
   },
   async dnsCheck(id: string) {

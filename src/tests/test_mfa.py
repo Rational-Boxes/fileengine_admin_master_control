@@ -213,20 +213,22 @@ def test_from_config_returns_nothing_rather_than_a_broken_client():
     assert isinstance(mfa.from_config(_cfg()), LdapManagerFactors)
 
 
-def test_the_tenant_context_is_not_a_real_tenant():
-    # ldap_manager resolves permitted methods as "deployment cap ∩ that tenant's
-    # policy", and its internal endpoints are tenant-addressed. Passing a REAL
-    # tenant would let its administrator disable TOTP and thereby block enrolment
-    # for this console — a tenant-scoped setting denying the highest-trust tier
-    # its second factor. A tenant with no policy row inherits the full cap.
-    ctx = Config().mfa_tenant_context
-    assert ctx == "__deployment__"
-    assert not ctx.isalnum(), "it should not look like a tenant id someone could create"
+def test_the_tenant_context_is_empty_not_an_invented_name():
+    """No made-up sentinel, because THE CORE PROVISIONS ANY TENANT IT IS ASKED ABOUT.
+
+    This was `__deployment__`, reasoning that a tenant with no policy row inherits
+    the full method cap. That much is true; what it missed is that
+    `Database::create_tenant_schema` inserts into `public.tenants` with the default
+    state `live`, so in an estate that provisions on first reference a
+    plausible-looking name is a tenant waiting to be created — and it would then
+    read as LIVE in the registry this console displays.
+
+    An empty string cannot be taken for a tenant id by anything downstream.
+    """
+    assert Config().mfa_tenant_context == ""
 
 
-def test_the_sentinel_would_not_pass_tenant_id_validation():
-    # The other half of the above, checked against the actual validator rather
-    # than by eye: nobody can provision a tenant that collides with it.
+def test_the_context_could_not_be_a_tenant_even_if_someone_tried():
     from admin_master_control.tenants import TenantError, validate_tenant_id
 
     with pytest.raises(TenantError):
@@ -249,7 +251,8 @@ class _Resp:
 
 
 def _client(monkeypatch, resp=None, raises=None):
-    store = LdapManagerFactors(url="http://ldap-manager:8093", internal_secret="shared")
+    store = LdapManagerFactors(url="http://ldap-manager:8093", internal_secret="shared",
+                               tenant_context="")
     sent = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -308,7 +311,7 @@ def test_the_internal_secret_is_sent_in_the_header(monkeypatch):
     store, sent = _client(monkeypatch, _Resp(200, {"enabled": True}))
     store.status(WHO)
     assert sent["headers"]["X-Internal-Auth"] == "shared"
-    assert sent["json"]["tenant"] == "__deployment__"
+    assert sent["json"]["tenant"] == ""
     assert sent["url"].endswith("/internal/2fa/required")
 
 

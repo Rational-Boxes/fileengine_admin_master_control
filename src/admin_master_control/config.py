@@ -60,6 +60,30 @@ class Config:
     pg_user: str = field(default_factory=lambda: _env("AMC_PG_USER", _env("FILEENGINE_PG_USER", "")))
     pg_password: str = field(default_factory=lambda: _env("AMC_PG_PASSWORD", _env("FILEENGINE_PG_PASSWORD", "")))
 
+    # ── The tenant registry, read-only (§3.4b) ─────────────────────────────
+    #
+    # `public.tenants` in the CORE's global schema is the one list of tenants and
+    # the one lifecycle state — provisioning writes it and the doors read it to
+    # decide whether a login is admitted. This console reads the same rows so that
+    # what an administrator sees is what the doors enforce.
+    #
+    # A separate DSN from AMC_PG_* on purpose: that is this application's OWN
+    # database (its queue, its decisions, its tenant requests) and this is another
+    # service's. Defaults to the platform-wide FILEENGINE_PG_* so a normal
+    # deployment configures it once.
+    #
+    # The connection is opened read-only, so a stray write fails at the database.
+    core_pg_host: str = field(default_factory=lambda: _env(
+        "AMC_CORE_PG_HOST", _env("FILEENGINE_PG_HOST", "localhost")))
+    core_pg_port: int = field(default_factory=lambda: _int(
+        "AMC_CORE_PG_PORT", _int("FILEENGINE_PG_PORT", 5432)))
+    core_pg_database: str = field(default_factory=lambda: _env(
+        "AMC_CORE_PG_DATABASE", _env("FILEENGINE_PG_DATABASE", "fileengine")))
+    core_pg_user: str = field(default_factory=lambda: _env(
+        "AMC_CORE_PG_USER", _env("FILEENGINE_PG_USER", "")))
+    core_pg_password: str = field(default_factory=lambda: _env(
+        "AMC_CORE_PG_PASSWORD", _env("FILEENGINE_PG_PASSWORD", "")))
+
     # ── What it reads, through APIs rather than through schemas (§5.1) ─────
     audit_url: str = field(default_factory=lambda: _env("AMC_AUDIT_URL", ""))
     # The credential this application reads the ledger with. NOT a system_admin
@@ -153,14 +177,25 @@ class Config:
     mfa_methods: str = field(default_factory=lambda: _env("AMC_MFA_METHODS", "totp,recovery"))
 
     # ldap_manager's internal 2FA endpoints are tenant-addressed and resolve
-    # permitted methods as "deployment cap ∩ that tenant's policy". Deployment
-    # roles live outside every tenant OU, so no tenant's policy should govern
-    # them — and passing a REAL tenant would let its admin disable TOTP and
-    # thereby block enrollment for this console. A tenant with no policy row
-    # inherits the full cap, so this sentinel resolves to the cap and nothing
-    # narrower. It must not name a real tenant.
+    # permitted methods as "deployment cap ∩ that tenant's policy". Deployment roles
+    # live outside every tenant OU, so no tenant's policy should govern them — and
+    # passing a REAL tenant would let its administrator disable TOTP and thereby
+    # block enrollment for this console.
+    #
+    # EMPTY, not a made-up name. This was `__deployment__`, on the reasoning that a
+    # tenant with no policy row inherits the full cap — which is true, and misses
+    # that THE CORE AUTO-REGISTERS ANY TENANT IT IS ASKED ABOUT:
+    # Database::create_tenant_schema inserts into public.tenants with the default
+    # state `live`. In an estate that provisions on first reference there is no such
+    # thing as an inert sentinel tenant string — a plausible-looking name is a tenant
+    # waiting to be created, and it would then appear in the registry as LIVE, in the
+    # very list this console displays.
+    #
+    # An empty string cannot be taken for a tenant id by anything downstream, and it
+    # resolves to the same deployment method cap — measured against the running
+    # ldap_manager, which returns identical `methods` for both.
     mfa_tenant_context: str = field(default_factory=lambda: _env(
-        "AMC_MFA_TENANT_CONTEXT", "__deployment__"))
+        "AMC_MFA_TENANT_CONTEXT", ""))
 
     # How long the pre-session challenge lives — the window between a correct
     # password and a proven factor, so: short.

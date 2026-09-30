@@ -35,19 +35,7 @@ job is asserted to be structured data with no credentials in it, and
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
-
-from . import _harness
 from admin_master_control import tenants as t
-from admin_master_control.administrators import AdministratorRegistry, bootstrap_owner
-from admin_master_control.app import build_app
-from admin_master_control.auth import StaticDeploymentDirectory
-from admin_master_control.config import Config
-from admin_master_control.roles import (
-    SYSTEM_OBSERVER,
-    SYSTEM_SECURITY,
-    SYSTEM_TENANTS,
-)
 
 TEN = "ten@rationalboxes.com"
 OBS = "obs@rationalboxes.com"
@@ -62,12 +50,6 @@ def _ready(tenant_id="acme", base=BASE, address=ADDR, **kw) -> t.StaticResolver:
     return t.StaticResolver(
         answers={h: (address,) for h in t.hostnames_for(tenant_id, base)}, **kw)
 
-
-def _req(tenant_id="acme", **over) -> t.TenantRequest:
-    kw = {"tenant_id": tenant_id, "base_domain": BASE, "address": ADDR,
-          "initial_admin": "admin@acme.test", "requested_by": TEN}
-    kw.update(over)
-    return t.TenantRequest(**kw)
 
 
 # ── the tenant id reaches four interpreters (§5.3.1) ───────────────────────
@@ -201,277 +183,62 @@ def test_the_local_resolver_reports_itself_as_not_authoritative():
     assert detail
 
 
-# ── the gate BLOCKS provisioning, which is the whole point ─────────────────
+# ── the job handed to the runner (§5.3) ────────────────────────────────────
+#
+# The gate itself is now the registry's conditional UPDATE, so the tests that used to
+# live here — "provisioning is refused unless the gate passed", the override, the
+# double press — moved to test_registry.py where the gate actually is. What remains
+# here is the pure part: validation, derivation, the DNS check and the job payload.
 
 
-@pytest.mark.parametrize("state", [t.REQUESTED, t.AWAITING_DNS, t.PROVISIONING,
-                                   t.LIVE, t.FAILED])
-def test_provisioning_is_refused_unless_the_gate_passed(state):
-    # THE test in this file. Everything above only matters because of this.
-    req = _req(state=state)
-    with pytest.raises(t.TenantError) as e:
-        t.provisioning_job(req, requested_by=TEN)
-    assert "rate limit" in str(e.value), "the refusal should say what it protects"
-
-
-def test_a_verified_request_may_provision():
-    req = _req()
-    t.verify(req, _ready())
-    assert req.state == t.VERIFIED and req.may_provision
-
-
-def test_a_failed_check_leaves_the_request_waiting_not_verified():
-    req = _req()
-    t.verify(req, t.StaticResolver(answers={}))
-    assert req.state == t.AWAITING_DNS
-    assert not req.may_provision
-
-
-def test_a_recheck_can_take_a_request_back_out_of_verified():
-    # DNS can regress — a record edited, a zone reloaded, a TTL expiring onto a
-    # stale value. Verified is a reading, not an achievement.
-    req = _req()
-    t.verify(req, _ready())
-    assert req.may_provision
-    t.verify(req, t.StaticResolver(answers={}))
-    assert not req.may_provision
-
-
-# ── the override: the one path that can burn the shared limit ──────────────
-
-
-def test_an_override_needs_a_reason_and_an_actor():
-    with pytest.raises(t.TenantError):
-        t.override(_req(), by=TEN, reason="")
-    with pytest.raises(t.TenantError):
-        t.override(_req(), by="", reason="split-horizon DNS, verified by hand")
-
-
-def test_an_override_unblocks_provisioning():
-    req = _req()
-    t.override(req, by=TEN, reason="CDN in front; apex verified out of band")
-    assert req.may_provision
-    assert t.provisioning_job(req, requested_by=TEN)["extra_vars"]["tenant_id"] == "acme"
-
-
-def test_an_override_is_always_visible():
-    # Never a quiet flag. If provisioning later fails at the certificate step and
-    # consumes issuance for the domain, the record of who decided to skip the
-    # check and why is the only way to understand it.
-    req = _req()
-    t.override(req, by=TEN, reason="zone is managed by the customer")
-    shown = req.for_display()
-    assert shown["override"] == {"by": TEN,
-                                 "reason": "zone is managed by the customer"}
-
-
-def test_an_override_survives_into_the_job():
-    req = _req()
-    t.override(req, by=TEN, reason="customer-managed zone")
-    job = t.provisioning_job(req, requested_by=TEN)
-    assert job["dns_overridden_by"] == TEN
-    # The REASON, not just the actor. If this run burns the domain's issuance
-    # limit, who pressed it is in the audit trail either way; what they believed
-    # about the zone is the only thing that explains the decision.
-    assert job["dns_override_reason"] == "customer-managed zone"
-    assert job["dns_verified"] is False, "an override is not a verification"
-
-
-def test_a_live_tenant_cannot_be_overridden_back_into_provisioning():
-    with pytest.raises(t.TenantError):
-        t.override(_req(state=t.LIVE), by=TEN, reason="because")
-
-
-# ── the job is data for a runner, and carries no credentials (§5.3) ────────
+def _job(**over):
+    kw = dict(tenant_id="acme", base_domain=BASE, address=ADDR,
+              initial_admin="admin@acme.test",
+              hostnames=t.hostnames_for("acme", BASE), requested_by=TEN,
+              dns_verified=True)
+    kw.update(over)
+    return t.provisioning_job(**kw)
 
 
 def test_the_job_passes_parameters_as_structured_data():
-    req = _req()
-    t.verify(req, _ready())
-    job = t.provisioning_job(req, requested_by=TEN)
+    job = _job()
     assert job["extra_vars"]["tenant_id"] == "acme"
     assert isinstance(job["extra_vars"], dict), "not a command line"
     assert "command" not in job and "argv" not in job and "shell" not in job
 
 
 def test_the_job_carries_no_credential():
-    req = _req()
-    t.verify(req, _ready())
-    blob = str(t.provisioning_job(req, requested_by=TEN)).lower()
+    blob = str(_job()).lower()
     for secret in ("password", "vault", "secret", "token", "api_key", "private_key"):
         assert secret not in blob, f"the job should not carry {secret}"
 
 
 def test_the_job_names_who_asked():
-    req = _req()
-    t.verify(req, _ready())
-    assert t.provisioning_job(req, requested_by=TEN)["requested_by"] == TEN
+    assert _job()["requested_by"] == TEN
     with pytest.raises(t.TenantError):
-        t.provisioning_job(req, requested_by="")
+        _job(requested_by="")
 
 
-# ── through the API ────────────────────────────────────────────────────────
+def test_the_job_carries_the_override_reason_not_just_the_actor():
+    # The reason was missing at first while the actor was present, which got the
+    # emphasis backwards. If this run burns the domain's issuance limit, who pressed
+    # it is in the audit trail either way; what they believed about the zone is the
+    # only thing that explains the decision.
+    job = _job(dns_verified=False, override_by=TEN, override_reason="customer-managed zone")
+    assert job["dns_overridden_by"] == TEN
+    assert job["dns_override_reason"] == "customer-managed zone"
+    assert job["dns_verified"] is False, "an override is not a verification"
 
 
-def _cfg() -> Config:
-    c = Config()
-    c.jwt_secret = "deployment-tier-secret"
-    c.token_audience = "fileengine-system-admin"
-    c.require_mfa = True
-    c.monitor_host = "127.0.0.1"
-    c.audit_url = "http://audit:8097"
-    # A second factor is required (the default), so it must also be CHECKABLE.
-    # Readiness reports "required but no store configured" otherwise, which is the
-    # point: enforcement that cannot reach its source refuses every login.
-    c.mfa_url = "http://ldap-manager:8093"
-    c.mfa_internal_secret = "internal-shared-secret"
-    c.bootstrap_owner = ""
-    return c
+def test_the_job_no_longer_second_guesses_the_gate():
+    """It used to refuse unless a request object said `verified`.
 
-
-def _client(resolver=None):
-    d = StaticDeploymentDirectory()
-    for who, roles in ((TEN, {SYSTEM_TENANTS}), (OBS, {SYSTEM_OBSERVER}),
-                       (SEC, {SYSTEM_SECURITY})):
-        d.passwords[who] = "pw"
-        d.grants[who] = roles
-    reg = AdministratorRegistry()
-    bootstrap_owner(reg, "james@rationalboxes.com")
-    return TestClient(build_app(_cfg(), reg, d, None, None,
-                                resolver if resolver is not None else _ready(),
-                                _harness.factors(TEN, OBS, SEC)))
-
-
-def _hdr(client, who=TEN):
-    return _harness.headers(client, who)
-
-
-def _body(tenant_id="acme"):
-    return {"tenant_id": tenant_id, "base_domain": BASE, "address": ADDR,
-            "initial_admin": "admin@acme.test"}
-
-
-def test_requesting_a_tenant_returns_the_records_to_create():
-    c = _client()
-    r = c.post("/v1/tenants", json=_body(), headers=_hdr(c))
-    assert r.status_code == 201, r.text
-    body = r.json()
-    assert body["state"] == t.REQUESTED
-    assert not body["may_provision"]
-    assert [rec["name"] for rec in body["records"]] == [
-        "acme.rationalboxes.com", "acme-drive.rationalboxes.com"]
-    assert all(rec["zone_line"] for rec in body["records"])
-
-
-def test_the_api_refuses_to_provision_before_the_check():
-    c = _client()
-    h = _hdr(c)
-    c.post("/v1/tenants", json=_body(), headers=h)
-    r = c.post("/v1/tenants/acme/provision", headers=h)
-    # 409, not 400: the request is well-formed, the SEQUENCE is wrong.
-    assert r.status_code == 409
-    assert "rate limit" in r.json()["detail"]
-
-
-def test_the_api_provisions_after_a_passing_check():
-    c = _client()
-    h = _hdr(c)
-    c.post("/v1/tenants", json=_body(), headers=h)
-    assert c.post("/v1/tenants/acme/dns-check", headers=h).json()["may_provision"]
-    r = c.post("/v1/tenants/acme/provision", headers=h)
-    assert r.status_code == 202, "the work is REQUESTED, not done"
-    assert r.json()["tenant"]["state"] == t.PROVISIONING
-    assert r.json()["job"]["extra_vars"]["tenant_id"] == "acme"
-
-
-def test_a_failing_check_through_the_api_still_blocks():
-    c = _client(resolver=t.StaticResolver(answers={"acme.rationalboxes.com": (ADDR,)}))
-    h = _hdr(c)
-    c.post("/v1/tenants", json=_body(), headers=h)
-    checked = c.post("/v1/tenants/acme/dns-check", headers=h).json()
-    assert not checked["may_provision"]
-    assert "acme-drive" in checked["dns"]["blocking_reason"]
-    assert c.post("/v1/tenants/acme/provision", headers=h).status_code == 409
-
-
-def test_the_override_route_requires_a_reason():
-    c = _client(resolver=t.StaticResolver(answers={}))
-    h = _hdr(c)
-    c.post("/v1/tenants", json=_body(), headers=h)
-    assert c.post("/v1/tenants/acme/dns-override", json={"reason": ""},
-                  headers=h).status_code == 400
-    r = c.post("/v1/tenants/acme/dns-override",
-               json={"reason": "customer-managed zone, verified by hand"}, headers=h)
-    assert r.status_code == 200
-    assert r.json()["may_provision"]
-    assert r.json()["override"]["by"] == TEN
-
-
-def test_the_override_actor_comes_from_the_token_not_the_body():
-    # There is no field for it, and that is the assertion: an override is
-    # attributable to whoever authenticated, and a body-supplied name would make
-    # the record worthless exactly when it matters.
-    c = _client(resolver=t.StaticResolver(answers={}))
-    h = _hdr(c)
-    c.post("/v1/tenants", json=_body(), headers=h)
-    r = c.post("/v1/tenants/acme/dns-override",
-               json={"reason": "r", "by": "someone-else@example.com"}, headers=h)
-    assert r.status_code == 200
-    assert r.json()["override"]["by"] == TEN
-
-
-def test_an_invalid_id_is_refused_at_the_route():
-    c = _client()
-    r = c.post("/v1/tenants", json=_body("Acme Corp"), headers=_hdr(c))
-    assert r.status_code == 400
-
-
-def test_a_duplicate_request_is_refused():
-    c = _client()
-    h = _hdr(c)
-    assert c.post("/v1/tenants", json=_body(), headers=h).status_code == 201
-    assert c.post("/v1/tenants", json=_body(), headers=h).status_code == 409
-
-
-# ── authority ──────────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("method,path,body", [
-    ("post", "/v1/tenants", _body()),
-    ("post", "/v1/tenants/acme/dns-check", None),
-    ("post", "/v1/tenants/acme/dns-override", {"reason": "r"}),
-    ("post", "/v1/tenants/acme/provision", None),
-])
-def test_only_system_tenants_may_change_anything(method, path, body):
-    # system_security reads the whole estate and may not create a tenant;
-    # system_tenants creates tenants and may not read the security view. The
-    # roles are additive and unordered, and neither implies the other.
-    c = _client()
-    for who in (OBS, SEC):
-        r = getattr(c, method)(path, json=body, headers=_hdr(c, who))
-        assert r.status_code == 403, f"{who} should not reach {path}"
-
-
-def test_the_observer_baseline_can_watch_but_not_act():
-    # A tenant stuck part-way through creation is exactly the outstanding thing
-    # §3.2 exists to surface, and noticing it needs no authority to change it.
-    c = _client()
-    c.post("/v1/tenants", json=_body(), headers=_hdr(c, TEN))
-    h = _hdr(c, OBS)
-    assert c.get("/v1/tenants", headers=h).status_code == 200
-    assert c.get("/v1/tenants/acme", headers=h).json()["tenant_id"] == "acme"
-    assert c.get("/v1/tenants/acme/records", headers=h).status_code == 200
-    assert c.post("/v1/tenants/acme/dns-check", headers=h).status_code == 403
-
-
-def test_an_unauthenticated_caller_reaches_nothing():
-    c = _client()
-    assert c.get("/v1/tenants").status_code in (401, 403)
-    assert c.post("/v1/tenants", json=_body()).status_code in (401, 403)
-
-
-def test_an_unknown_tenant_is_404_not_500():
-    c = _client()
-    h = _hdr(c)
-    assert c.post("/v1/tenants/nosuch/dns-check", headers=h).status_code == 404
-    assert c.get("/v1/tenants/nosuch", headers=_hdr(c, OBS)).status_code == 404
+    That was a check on a value the process had read earlier, so two callers could
+    both pass it. The gate is now the registry's conditional UPDATE — which either
+    claims the row or does not — and this function is only reached once that has
+    succeeded. A second opinion here could only ever disagree with the one that
+    counts.
+    """
+    # No state argument exists to be wrong about.
+    assert "state" not in _job()
+    assert _job(dns_verified=False)["extra_vars"]["tenant_id"] == "acme"

@@ -178,6 +178,10 @@ def test_only_phase_one_routes_are_mounted():
         ("GET", "/v1/tenants"),
         ("GET", "/v1/tenants/{tenant_id}"),
         ("GET", "/v1/tenants/{tenant_id}/records"),
+        # The human-readable name, for billing and high-level operations. A PUT
+        # because it is an idempotent replacement of a label — and it renames the
+        # LABEL only; tenant_id reaches four interpreters and is immutable.
+        ("PUT", "/v1/tenants/{tenant_id}/display-name"),
         ("POST", "/v1/tenants/{tenant_id}/dns-check"),
         ("POST", "/v1/tenants/{tenant_id}/dns-override"),
         ("POST", "/v1/tenants/{tenant_id}/provision"),
@@ -225,6 +229,9 @@ def test_every_write_is_a_record_or_a_request_never_an_execution():
         "/v1/tenants",
         "/v1/tenants/{tenant_id}/dns-check",
         "/v1/tenants/{tenant_id}/dns-override",
+        # Records a LABEL in the registry. Renames nothing that anything is keyed
+        # on: the identifier is immutable.
+        "/v1/tenants/{tenant_id}/display-name",
         # REQUESTS work. The one route whose effect leaves this application, and
         # it leaves as a queued job for a runner that holds the credentials this
         # application deliberately does not.

@@ -42,9 +42,13 @@ TWO THINGS THIS TIER DOES DIFFERENTLY, and the second is a trap:
   * Method resolution is "deployment cap ∩ that tenant's policy", and the
     endpoints are tenant-addressed. Passing a REAL tenant would let its
     administrator disable TOTP and thereby block enrollment for this console — a
-    tenant-scoped setting denying the highest-trust tier its second factor. So a
-    sentinel tenant with no policy row is passed instead, which inherits the full
-    cap and nothing narrower.
+    tenant-scoped setting denying the highest-trust tier its second factor. So an
+    EMPTY tenant is passed, which resolves to the deployment cap.
+
+    Not an invented sentinel like `__deployment__`, which was the first attempt:
+    the core AUTO-REGISTERS any tenant it is asked about, with the default state
+    `live`, so in this estate a plausible-looking name is a tenant waiting to be
+    created. See Config.mfa_tenant_context.
 
 Everything here FAILS CLOSED. An unreachable store refuses the login rather than
 admitting one, for the reason §3.4c gives about the tenant gate: "allow on error"
@@ -117,7 +121,7 @@ class LdapManagerFactors:
 
     url: str
     internal_secret: str
-    tenant_context: str = "__deployment__"
+    tenant_context: str = ""
     timeout_s: float = 5.0
 
     def _post(self, path: str, body: dict) -> dict:

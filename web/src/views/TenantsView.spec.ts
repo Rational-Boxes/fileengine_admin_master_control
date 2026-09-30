@@ -26,12 +26,21 @@ import { SYSTEM_OBSERVER, SYSTEM_TENANTS, useSession } from '@/stores/session'
 function row(over: Partial<TenantView> = {}): TenantView {
   return {
     tenant_id: 'acme',
-    state: 'verified',
+    display_name: 'Acme Corporation',
+    has_display_name: true,
+    schema_name: 'tenant_acme',
+    state: 'awaiting_dns',
+    admits_logins: false,
+    gate_cleared: true,
+    requested_here: true,
+    created_at: '',
+    state_since: '',
+    state_by: '',
+    state_note: '',
     base_domain: 'example.com',
     address: '203.0.113.10',
     initial_admin: 'a@acme.test',
     requested_by: 'ten@x',
-    requested_at: '2026-09-29T00:00:00+00:00',
     hostnames: ['acme.example.com', 'acme-drive.example.com'],
     records: [],
     may_provision: true,
@@ -99,10 +108,19 @@ describe('waiting is not failing', () => {
     expect(pill!.classes()).not.toContain('bad')
   })
 
-  it('shows failed as an error', async () => {
-    const w = await view([row({ state: 'failed', may_provision: false })])
-    const pill = w.findAll('.pill').find((p) => p.text().includes('failed'))
-    expect(pill!.classes()).toContain('bad')
+  it('uses the REGISTRY vocabulary, not an invented one', async () => {
+    // `verified` and `failed` were this console's own states and are gone: the
+    // registry is the single source and the doors compare against its values.
+    const w = await view([row({ state: 'suspended', admits_logins: false, may_provision: false })])
+    const pill = w.findAll('.pill').find((p) => p.text().includes('suspended'))
+    expect(pill!.classes()).toContain('warn')
+  })
+
+  it('reports logins from admits_logins, which only live sets', async () => {
+    const live = await view([row({ state: 'live', admits_logins: true, may_provision: false })])
+    expect(live.text()).toContain('admitted')
+    const susp = await view([row({ state: 'suspended', admits_logins: false, may_provision: false })])
+    expect(susp.text()).toContain('refused')
   })
 })
 
@@ -140,5 +158,41 @@ describe('the blocking reason is shown, not summarised', () => {
     ])
     expect(w.text()).toContain('resolves to 198.51.100.4')
     expect(w.text()).toContain('expected 203.0.113.10')
+  })
+})
+
+
+describe('the human-readable name', () => {
+  it('is what the row leads with, while the id stays visible', async () => {
+    // The label is what a human recognises; the id is what every other system uses.
+    // Hiding the id would make the page useless for the operations it exists for.
+    const w = await view([row({ display_name: 'Acme Corporation', has_display_name: true })])
+    expect(w.text()).toContain('Acme Corporation')
+    expect(w.text()).toContain('acme')
+  })
+
+  it('falls back to the id when unset, without pretending it is a name', async () => {
+    const w = await view([row({ display_name: 'acme', has_display_name: false })])
+    expect(w.text()).toContain('acme')
+  })
+})
+
+describe('tenants that predate this console', () => {
+  it('are listed, and are not offered a DNS check they cannot pass', async () => {
+    // THE regression this file now guards: the page listed only tenants requested
+    // here, so a deployment with seventy live ones showed nothing. And a tenant with
+    // no recorded base domain has nothing to check its DNS against.
+    const w = await view([
+      row({
+        tenant_id: 'default', display_name: 'default', has_display_name: false,
+        state: 'live', admits_logins: true, may_provision: false,
+        requested_here: false, base_domain: '', address: '', records: [],
+      }),
+    ])
+    expect(w.text()).toContain('default')
+    expect(w.findAll('button').some((b) => b.text() === 'Check DNS')).toBe(false)
+    // But it CAN be given a human-readable name, which is the main reason to reach
+    // for this page on an established estate.
+    expect(w.findAll('button').some((b) => b.text() === 'Name')).toBe(true)
   })
 })

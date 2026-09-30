@@ -31,7 +31,6 @@ granting is what `system_owner` exists to do. They execute nothing outside it.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
@@ -61,24 +60,26 @@ from .mfa import (
     MfaGate,
 )
 from .redactions import ErasureSource, register as redaction_register
-from .tenant_store import (
-    InMemoryTenantStore,
-    StoreUnavailable,
-    TenantExists,
-    TenantStore,
-)
-from .tenants import (
+from .job_store import InMemoryJobStore, JobStore, StoreUnavailable
+from .registry import (
+    CLAIMABLE,
     LIVE,
     PROVISIONING,
-    VERIFIED,
+    RegistryRefused,
+    RegistryUnavailable,
+    StaticTenantRegistry,
+    TenantRegistry,
+    schema_name_for,
+)
+from .tenants import (
     Resolver,
     StaticResolver,
     TenantError,
-    TenantRequest,
-    override as dns_override,
+    check_dns,
+    hostnames_for,
     provisioning_job,
     records_for,
-    verify as dns_verify,
+    validate_tenant_id,
 )
 from .incidents import (
     IncidentSource,
@@ -129,6 +130,12 @@ class TenantRequestBody(BaseModel):
     base_domain: str
     address: str
     initial_admin: str
+    #: The name a human uses. Optional, free text, and NEVER an identifier.
+    display_name: str = ""
+
+
+class DisplayNameBody(BaseModel):
+    display_name: str
 
 
 class OverrideBody(BaseModel):
@@ -162,7 +169,11 @@ def build_router(config: Config, registry: AdministratorRegistry,
                  incidents: IncidentSource | None = None,
                  erasures: ErasureSource | None = None,
                  resolver: Resolver | None = None,
-                 tenants: TenantStore | None = None,
+                 # NOT `registry`: that is the AdministratorRegistry above. Two
+                 # different registries in one signature is exactly the sort of
+                 # near-name that reads fine and binds the wrong object.
+                 tenant_registry: TenantRegistry | None = None,
+                 jobs: JobStore | None = None,
                  factors: FactorStore | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
@@ -614,85 +625,161 @@ def build_router(config: Config, registry: AdministratorRegistry,
     # because there is no DNS operation. And the playbook is executed by a runner
     # on the host that holds the vault password; these routes write a JOB (§5.3).
 
-    _store: TenantStore = tenants if tenants is not None else InMemoryTenantStore()
+    _registry: TenantRegistry = (tenant_registry if tenant_registry is not None
+                                 else StaticTenantRegistry())
+    _jobs: JobStore = jobs if jobs is not None else InMemoryJobStore()
     _resolver: Resolver = resolver if resolver is not None else StaticResolver(answers={})
 
-    def _must_get(tenant_id: str) -> TenantRequest:
+    def _records_of(t) -> list:
+        """The zone lines, derived rather than stored.
+
+        A tenant that predates this console has no base domain recorded, so there is
+        nothing to derive — an empty list, not a guess.
+        """
+        if not t.base_domain or not t.address:
+            return []
+        return [{"name": rec.name, "type": rec.type, "value": rec.value,
+                 "zone_line": rec.as_zone_line()}
+                for rec in records_for(t.tenant_id, t.base_domain, t.address)]
+
+    def _with_records(t) -> dict:
+        out = t.for_display()
+        out["hostnames"] = (hostnames_for(t.tenant_id, t.base_domain)
+                            if t.base_domain else [])
+        out["records"] = _records_of(t)
+        return out
+
+    def _must_get(tenant_id: str):
         try:
-            req = _store.get(tenant_id)
-        except StoreUnavailable as e:
+            t = _registry.get(tenant_id)
+        except RegistryUnavailable as e:
             # 503, not 404. "No such tenant" and "could not ask" need different
-            # responses, and reporting the first sends someone looking for a
-            # tenant that is fine.
+            # responses, and reporting the first sends someone looking for a tenant
+            # that is fine.
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail=str(e.args[0])) from e
-        if req is None:
+                                detail=str(e)) from e
+        if t is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-        return req
+        return t
 
     @r.post("/tenants", status_code=status.HTTP_201_CREATED)
     def request_tenant(body: TenantRequestBody,
                        principal: Principal = Depends(require(SYSTEM_TENANTS))):
         """Request a tenant, and return exactly the DNS records to create.
 
-        Step 1 of §3.4a. The response is meant for pasting into a zone file — the
-        administrator then updates the zone wherever the domain is managed, and
-        the gate below is what decides when provisioning may run.
+        Writes a row to the REGISTRY in state `requested` — the same table the doors
+        read and provisioning updates. There is no separate request table: the
+        registry already models `requested → awaiting_dns → provisioning → live`, so
+        a second one would be the same facts twice with two writers.
         """
         principal.authorising(SYSTEM_TENANTS)
         try:
-            req = TenantRequest(tenant_id=body.tenant_id, base_domain=body.base_domain,
-                                address=body.address, initial_admin=body.initial_admin,
-                                requested_by=principal.subject)
+            tenant_id = validate_tenant_id(body.tenant_id)
+            if not body.base_domain:
+                raise TenantError("a base domain is required")
+            if not body.address:
+                raise TenantError("the address the hostnames must point at is required")
+            if not body.initial_admin:
+                # A tenant with no administrator is a tenant nobody can manage, and
+                # the platform's own tenant.yml takes one for the same reason.
+                raise TenantError("a first administrator is required")
         except TenantError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         try:
-            # No prior existence check. The unique primary key decides, because a
-            # SELECT then an INSERT is two statements and a race: two
-            # administrators requesting the same id simultaneously both pass a
-            # check-then-insert, and only the constraint is authoritative.
-            _store.create(req)
-        except TenantExists as e:
+            # No prior existence check: a SELECT then an INSERT is two statements and
+            # a race, and only the registry's unique index is authoritative.
+            t = _registry.request(tenant_id=tenant_id, base_domain=body.base_domain,
+                                  address=body.address, initial_admin=body.initial_admin,
+                                  requested_by=principal.subject,
+                                  display_name=body.display_name.strip())
+        except RegistryRefused as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-        except StoreUnavailable as e:
+        except RegistryUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail=str(e.args[0])) from e
-        log.info("tenant %s requested by %s", req.tenant_id, principal.subject)
-        return req.for_display()
+                                detail=str(e)) from e
+        log.info("tenant %s requested by %s", tenant_id, principal.subject)
+        return _with_records(t)
 
     @r.get("/tenants")
-    def list_requests(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
-        """Every in-flight request and its state.
+    def list_tenants(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """EVERY tenant in the registry, not only the ones requested here.
 
-        Readable by the observer baseline: a tenant part-way through creation is
-        the outstanding thing §3.2 exists for, and knowing one is stuck needs no
-        authority to change it.
+        Built from the registry outward. Building it from this console's own request
+        rows outward is what made this page show nothing on a deployment with seventy
+        live tenants — they predate the console, so they have no request of ours, and
+        that is the normal case rather than a gap.
         """
         try:
-            return {"tenants": [t.for_display() for t in _store.list()]}
-        except StoreUnavailable as e:
+            return {"tenants": [_with_records(t) for t in _registry.list()]}
+        except RegistryUnavailable as e:
+            # NOT an empty list, which would report an estate with no tenants.
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail=str(e.args[0])) from e
+                                detail=str(e)) from e
 
     @r.get("/tenants/{tenant_id}")
-    def get_request(tenant_id: str,
-                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
-        return _must_get(tenant_id).for_display()
+    def get_tenant(tenant_id: str,
+                   principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        return _with_records(_must_get(tenant_id))
+
+    @r.put("/tenants/{tenant_id}/display-name")
+    def set_display_name(tenant_id: str, body: DisplayNameBody,
+                         principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Set the human-readable name, for billing and high-level operations.
+
+        This renames the LABEL and never the identifier. `tenant_id` reaches a
+        hostname, a Postgres schema, an LDAP DN and a file path, so it is immutable;
+        an organisation renaming itself must not move its data. Allowed in any
+        lifecycle state, including decommissioned, so a billing history stays readable.
+        """
+        principal.authorising(SYSTEM_TENANTS)
+        _must_get(tenant_id)
+        name = body.display_name.strip()
+        if len(name) > 200:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="that name is too long (200 characters)")
+        try:
+            t = _registry.set_display_name(tenant_id, name)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s display name set by %s", tenant_id, principal.subject)
+        return _with_records(t)
 
     @r.post("/tenants/{tenant_id}/dns-check")
     def check(tenant_id: str,
               principal: Principal = Depends(require(SYSTEM_TENANTS))):
         """Run the DNS gate.
 
-        Asks the zone's authoritative nameservers, compares the ADDRESS rather
-        than merely that something resolves, and checks EVERY hostname. Each of
-        those is a way a green tick can be wrong, and a wrong green tick here
-        burns certificate issuance for the whole domain.
+        Asks the zone's authoritative nameservers, compares the ADDRESS rather than
+        merely that something resolves, and checks EVERY hostname. Each of those is a
+        way a green tick can be wrong, and a wrong green tick here burns certificate
+        issuance for the whole domain.
         """
-        req = _must_get(tenant_id)
-        dns_verify(req, _resolver)
-        _store.save(req)
-        return req.for_display()
+        t = _must_get(tenant_id)
+        if not t.base_domain or not t.address:
+            # A tenant that predates this console has no recorded domain or address,
+            # so there is nothing to check it against. Said plainly rather than
+            # checked against empty strings and reported as a DNS failure.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{tenant_id} has no recorded base domain or address — it was "
+                       f"not requested through this console, so there is nothing to "
+                       f"check its DNS against.")
+        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver)
+        try:
+            t = _registry.record_dns(tenant_id, {
+                "ok": verdict.ok, "authoritative": verdict.authoritative,
+                "blocking_reason": verdict.blocking_reason,
+                "checks": [{"hostname": c.hostname, "ok": c.ok,
+                            "resolved": list(c.resolved), "expected": c.expected,
+                            "detail": c.detail} for c in verdict.checks],
+            })
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s DNS check: %s", tenant_id,
+                 "passed" if verdict.ok else verdict.blocking_reason)
+        return _with_records(t)
 
     @r.post("/tenants/{tenant_id}/dns-override")
     def do_override(tenant_id: str, body: OverrideBody,
@@ -700,91 +787,113 @@ def build_router(config: Config, registry: AdministratorRegistry,
         """Force past the DNS gate, recorded.
 
         There are legitimate reasons the check fails on a correct setup —
-        split-horizon DNS, a CDN in front, a zone the administrator does not
-        control but has been told is ready. This is the one path to provisioning
-        that can exhaust certificate issuance for every tenant on the domain,
-        which is why it takes a reason and keeps a name attached rather than
-        being a retry button.
+        split-horizon DNS, a CDN in front, a zone the administrator does not control
+        but has been told is ready. This is the one path to provisioning that can
+        exhaust certificate issuance for every tenant on the domain, which is why it
+        takes a reason and keeps a name attached rather than being a retry button.
         """
         authorised_as = principal.authorising(SYSTEM_TENANTS)
-        req = _must_get(tenant_id)
+        t = _must_get(tenant_id)
+        reason = body.reason.strip()
+        if not reason:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="an override needs a reason: it is the one path to provisioning "
+                       "that can exhaust certificate issuance for the whole deployment")
+        if t.state not in CLAIMABLE:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{tenant_id} is {t.state} — the DNS gate only applies before "
+                       f"provisioning")
         try:
-            dns_override(req, by=principal.subject, reason=body.reason)
-        except TenantError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-        _store.save(req)
+            t = _registry.record_override(tenant_id, principal.subject, reason)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
         log.warning("tenant %s DNS gate overridden by %s (as %s): %s",
-                    tenant_id, principal.subject, authorised_as, body.reason)
-        return req.for_display()
+                    tenant_id, principal.subject, authorised_as, reason)
+        return _with_records(t)
 
     @r.post("/tenants/{tenant_id}/provision", status_code=status.HTTP_202_ACCEPTED)
     def provision(tenant_id: str,
                   principal: Principal = Depends(require(SYSTEM_TENANTS))):
-        """Write the provisioning job for the runner to claim.
+        """Claim the request and write the job for the runner.
 
-        202, not 200: this application has ASKED. A playbook is minutes and an
-        HTTP request is not, so the work is a job with state, and the runner —
-        which holds the credentials this application deliberately does not —
-        claims it, executes one at a time, and reports back.
+        202, not 200: this application has ASKED. A playbook is minutes and an HTTP
+        request is not, so the work is a job with state, and the runner — which holds
+        the credentials this application deliberately does not — claims it.
         """
         authorised_as = principal.authorising(SYSTEM_TENANTS)
-        before = _must_get(tenant_id)            # 404 before anything else
+        before = _must_get(tenant_id)          # 404 before anything else
 
-        # CLAIM FIRST. One conditional UPDATE moves verified -> provisioning, so
-        # two administrators pressing this at the same moment cannot both queue a
-        # run. Reading the state and then writing it lets both through — each sees
-        # `verified`, each passes may_provision — and two runs mean two certificate
-        # issuance attempts against a rate limit SHARED BY EVERY TENANT on the
-        # domain. That is the exact failure the DNS gate exists to prevent, so the
-        # gate has to be held by the database rather than by arrival order.
-        claimed = _store.claim_for_provisioning(tenant_id)
+        # CLAIM FIRST, in the REGISTRY. One conditional UPDATE moves a gated request
+        # to `provisioning`, so two administrators pressing this at the same moment
+        # cannot both queue a run — and two runs mean two certificate issuance
+        # attempts against a rate limit SHARED BY EVERY TENANT on the domain. The
+        # gate is held by the database rather than by arrival order.
+        try:
+            claimed = _registry.claim_for_provisioning(tenant_id, principal.subject)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
         if claimed is None:
-            # Refused — and WHICH refusal matters. Building the job first and
-            # letting its guard produce the message told the second presser "the
-            # DNS gate has not passed" about a tenant whose gate had passed and
-            # whose run was already underway, which sends them to re-check DNS
-            # that is fine.
+            # WHICH refusal matters. An earlier version let the job builder produce
+            # this message, which told the second presser "the DNS gate has not
+            # passed" about a tenant whose gate HAD passed and whose run was already
+            # underway — sending them to re-check DNS that was fine.
             now = _must_get(tenant_id)
-            # The discriminator is whether the tenant is already PAST the gate,
-            # not what this request happened to read. An earlier version asked
-            # `before.may_provision`, which is False on a straightforward second
-            # press — the second caller reads `provisioning`, having never seen
-            # `verified` — so it fell into the gate branch and produced the wrong
-            # message for the commonest case there is.
-            if now.state in (PROVISIONING, LIVE) or before.may_provision:
-                # It has passed the gate and been started. Nothing is wrong, and
-                # nothing more should happen.
-                detail = (f"tenant {tenant_id} is already {now.state} — another "
-                          f"administrator started it a moment ago. No second run "
-                          f"has been queued.")
+            if now.state == PROVISIONING:
+                # The race, or a double click. Distinguished from "in service"
+                # because they are different situations: a tenant live since June
+                # being told "another administrator started it a moment ago" is
+                # simply false, and reads as a race that did not happen.
+                detail = (f"tenant {tenant_id} is already being provisioned — another "
+                          f"administrator started it a moment ago. No second run has "
+                          f"been queued.")
+            elif now.state not in CLAIMABLE:
+                detail = (f"tenant {tenant_id} is {now.state} and cannot be "
+                          f"provisioned again. Provisioning applies to a tenant being "
+                          f"created, not one already in service.")
             else:
-                # It never passed the gate. Reuse the gate's own words, which name
-                # what the refusal protects.
-                try:
-                    provisioning_job(now, requested_by=principal.subject)
-                    detail = f"tenant {tenant_id} is {now.state}, not verified"
-                except TenantError as e:
-                    detail = str(e)
+                detail = (f"tenant {tenant_id} is {now.state} and the DNS gate has not "
+                          f"passed and has not been overridden. Provisioning now would "
+                          f"fail at the certificate step and consume the domain's rate "
+                          f"limit, which is shared by every tenant.")
             # 409, not 400: the request is well-formed, the SEQUENCE is wrong.
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
-        # The claim succeeded, so this request WAS verified. `claimed` now reads
-        # `provisioning`, and provisioning_job rightly refuses that state — its
-        # guard protects direct callers and is not relaxed here. So the job is
-        # built from a request in the state that was claimed: the pre-claim read
-        # when it agrees, otherwise the claimed row with that state restored (which
-        # happens only if someone verified it between the read and the claim).
-        source = before if before.may_provision else replace(claimed, state=VERIFIED)
-        try:
-            job = provisioning_job(source, requested_by=principal.subject)
-        except TenantError as e:  # pragma: no cover - the claim already proved this
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-
+        job = provisioning_job(
+            tenant_id=claimed.tenant_id, base_domain=claimed.base_domain,
+            address=claimed.address, initial_admin=claimed.initial_admin,
+            hostnames=hostnames_for(claimed.tenant_id, claimed.base_domain)
+            if claimed.base_domain else [],
+            requested_by=principal.subject,
+            dns_verified=bool((before.dns or {}).get("ok")),
+            override_by=claimed.override_by, override_reason=claimed.override_reason)
         job["authorised_as"] = authorised_as
-        job["job_id"] = _store.record_job(tenant_id, job)
+        try:
+            job["job_id"] = _jobs.record(tenant_id, job)
+            _registry.attach_job(tenant_id, job["job_id"])
+        except (StoreUnavailable, RegistryUnavailable) as e:
+            # The claim already moved the registry to `provisioning`. Say so rather
+            # than implying nothing happened: the tenant is not reachable in that
+            # state, and an operator needs to know it needs picking up by hand.
+            log.error("tenant %s was claimed but its job could not be written: %s",
+                      tenant_id, e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"{tenant_id} has been moved to provisioning but the job could "
+                       f"not be queued: {e}") from e
         log.info("tenant %s provisioning job %s written by %s",
                  tenant_id, job["job_id"], principal.subject)
-        return {"job": job, "tenant": _must_get(tenant_id).for_display()}
+        return {"job": job, "tenant": _with_records(_must_get(tenant_id))}
+
+    @r.get("/tenants/{tenant_id}/records")
+    def dns_records(tenant_id: str,
+                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """The records to create, on their own, for pasting into a zone."""
+        t = _must_get(tenant_id)
+        return {"tenant_id": tenant_id, "records": _records_of(t)}
 
     @r.get("/provisioning-jobs")
     def provisioning_jobs(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
@@ -800,18 +909,9 @@ def build_router(config: Config, registry: AdministratorRegistry,
         no authority to change it.
         """
         try:
-            return {"jobs": _store.jobs()}
+            return {"jobs": _jobs.jobs()}
         except StoreUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail=str(e.args[0])) from e
-
-    @r.get("/tenants/{tenant_id}/records")
-    def dns_records(tenant_id: str,
-                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
-        """The records to create, on their own, for pasting into a zone."""
-        req = _must_get(tenant_id)
-        return {"tenant_id": tenant_id,
-                "records": [{"name": rec.name, "type": rec.type, "value": rec.value,
-                             "zone_line": rec.as_zone_line()} for rec in req.records]}
 
     return r

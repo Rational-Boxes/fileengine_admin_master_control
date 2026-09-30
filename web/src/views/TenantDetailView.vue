@@ -38,13 +38,20 @@ function copyZone() {
     <div v-else-if="error" class="notice bad">{{ error }}</div>
 
     <template v-else-if="t">
-      <h1>{{ t.tenant_id }}</h1>
+      <h1>{{ t.display_name }}</h1>
       <p class="sub">
-        Requested by {{ t.requested_by }} · {{ t.requested_at }}
+        <!-- The identifier, always visible. The heading is the label a human
+             recognises; this is what every other system uses, and it cannot change. -->
+        <span class="mono">{{ t.tenant_id }}</span>
+        · schema <span class="mono">{{ t.schema_name }}</span>
+        <template v-if="t.requested_here"> · requested by {{ t.requested_by }}</template>
+        <template v-else>
+          · created before this console, so it has no creation details here
+        </template>
       </p>
 
       <div class="grid two">
-        <section class="card">
+        <section v-if="t.records.length" class="card">
           <h2>DNS records to create</h2>
           <p class="hint">
             Create these wherever this domain is managed. This console never
@@ -59,11 +66,20 @@ function copyZone() {
 
         <section class="card">
           <h2>Gate</h2>
-          <p>
-            <span class="pill" :class="t.may_provision ? 'ok' : 'warn'">
-              {{ t.may_provision ? 'may provision' : 'blocked' }}
+          <p class="row">
+            <span class="pill">{{ t.state.replace(/_/g, ' ') }}</span>
+            <span class="pill" :class="t.admits_logins ? 'ok' : ''">
+              logins {{ t.admits_logins ? 'admitted' : 'refused' }}
             </span>
-            <span class="pill">{{ t.state.replace('_', ' ') }}</span>
+            <span v-if="!t.admits_logins" class="pill"
+                  :class="t.may_provision ? 'ok' : 'warn'">
+              {{ t.may_provision ? 'may provision' : 'gate closed' }}
+            </span>
+          </p>
+          <p v-if="t.state_by" class="muted small">
+            moved to {{ t.state.replace(/_/g, ' ') }} by {{ t.state_by }}
+            <template v-if="t.state_since"> · {{ t.state_since }}</template>
+            <template v-if="t.state_note"> — “{{ t.state_note }}”</template>
           </p>
           <template v-if="t.dns">
             <table class="checks">
@@ -109,12 +125,16 @@ function copyZone() {
       <section class="card">
         <h2>Details</h2>
         <dl>
-          <dt>Hostnames</dt>
-          <dd class="mono">{{ t.hostnames.join(', ') }}</dd>
-          <dt>Address</dt>
-          <dd class="mono">{{ t.address }}</dd>
-          <dt>First administrator</dt>
-          <dd>{{ t.initial_admin }}</dd>
+          <dt v-if="t.hostnames.length">Hostnames</dt>
+          <dd v-if="t.hostnames.length" class="mono">{{ t.hostnames.join(', ') }}</dd>
+          <dt v-if="t.address">Address</dt>
+          <dd v-if="t.address" class="mono">{{ t.address }}</dd>
+          <dt v-if="t.initial_admin">First administrator</dt>
+          <dd v-if="t.initial_admin">{{ t.initial_admin }}</dd>
+          <dt>Schema</dt>
+          <dd class="mono">{{ t.schema_name }}</dd>
+          <dt v-if="t.created_at">Created</dt>
+          <dd v-if="t.created_at">{{ t.created_at }}</dd>
           <dt v-if="t.job_id">Provisioning job</dt>
           <dd v-if="t.job_id" class="mono">{{ t.job_id }}</dd>
         </dl>
@@ -154,6 +174,9 @@ section.card {
 }
 .small {
   font-size: 0.78rem;
+}
+.row {
+  margin: 0 0 0.5rem;
 }
 dl {
   display: grid;

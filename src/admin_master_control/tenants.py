@@ -77,17 +77,19 @@ RESERVED_IDS = frozenset({
 # DNS comes BEFORE provisioning rather than during it. The proposal records that
 # an earlier draft had it the other way round, and the rate-limit argument above
 # is why the order matters.
-REQUESTED = "requested"
-AWAITING_DNS = "awaiting_dns"
-VERIFIED = "verified"
-PROVISIONING = "provisioning"
-LIVE = "live"
-FAILED = "failed"
-
-REQUEST_STATES = (REQUESTED, AWAITING_DNS, VERIFIED, PROVISIONING, LIVE, FAILED)
-
-#: Only these may be handed to the runner.
-READY_TO_PROVISION = (VERIFIED,)
+# THE LIFECYCLE IS NOT DEFINED HERE ANY MORE. It lives in registry.py, which reads
+# and writes `public.tenants` — the core's table, the one the doors compare against.
+#
+# This module briefly had its own copy, including a `verified` state and a `failed`
+# state that the registry does not have, plus four names that it does. Two
+# vocabularies for one tenant is drift with a silent failure mode, so what is left
+# here is only what has no other home: validating the id, deriving the hostnames and
+# records, and running the DNS check. None of it decides a state.
+#
+# `verified` in particular is gone rather than renamed. It was a cached summary of
+# "the DNS check passed or somebody overrode it", and the registry evaluates that as
+# a predicate inside the same UPDATE that claims the request — so there is nothing
+# to keep in step. See registry.py.
 
 
 class TenantError(ValueError):
@@ -280,178 +282,58 @@ def check_dns(tenant_id: str, base_domain: str, address: str,
                       detail="" if ok else "one or more hostnames are not ready")
 
 
-# ── the request, and its state ─────────────────────────────────────────────
-
-
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
-
-
-@dataclass
-class TenantRequest:
-    """A tenant part-way through creation — "exactly the outstanding thing §3.2
-    exists for, and today it is tracked in somebody's terminal scrollback"."""
-
-    tenant_id: str
-    base_domain: str
-    address: str
-    initial_admin: str
-    requested_by: str
-    state: str = REQUESTED
-    requested_at: str = field(default_factory=_now)
-    dns: Optional[DnsVerdict] = None
-    #: Set only by an explicit, attributed override.
-    override_by: str = ""
-    override_reason: str = ""
-    #: The runner's last word.
-    failed_step: str = ""
-    failure_detail: str = ""
-    retry_safe: bool = False
-    job_id: str = ""
-
-    def __post_init__(self) -> None:
-        validate_tenant_id(self.tenant_id)
-        if not self.base_domain:
-            raise TenantError("a base domain is required")
-        if not self.address:
-            raise TenantError("the address the hostnames must point at is required")
-        if not self.initial_admin:
-            # A tenant with no administrator is a tenant nobody can manage, and
-            # the platform's own tenant.yml takes one for the same reason.
-            raise TenantError("an initial administrator is required")
-        if not self.requested_by:
-            raise TenantError("a request needs an actor")
-
-    @property
-    def hostnames(self) -> list[str]:
-        return hostnames_for(self.tenant_id, self.base_domain)
-
-    @property
-    def records(self) -> list[DnsRecord]:
-        return records_for(self.tenant_id, self.base_domain, self.address)
-
-    @property
-    def may_provision(self) -> bool:
-        """Whether the runner may be handed this request.
-
-        `verified` only. An override moves the state to `verified` and records
-        who did it, so there is ONE gate rather than a gate plus a bypass that
-        callers have to remember to check.
-        """
-        return self.state in READY_TO_PROVISION
-
-    def for_display(self) -> dict:
-        out = {
-            "tenant_id": self.tenant_id,
-            "state": self.state,
-            "base_domain": self.base_domain,
-            "address": self.address,
-            "initial_admin": self.initial_admin,
-            "requested_by": self.requested_by,
-            "requested_at": self.requested_at,
-            "hostnames": self.hostnames,
-            "records": [{"name": r.name, "type": r.type, "value": r.value,
-                         "zone_line": r.as_zone_line()} for r in self.records],
-            "may_provision": self.may_provision,
-        }
-        if self.dns is not None:
-            out["dns"] = {
-                "ok": self.dns.ok,
-                "authoritative": self.dns.authoritative,
-                "blocking_reason": self.dns.blocking_reason,
-                "checks": [{"hostname": c.hostname, "ok": c.ok,
-                            "resolved": list(c.resolved), "expected": c.expected,
-                            "detail": c.detail} for c in self.dns.checks],
-            }
-        if self.override_by:
-            # Always visible. The override is the one path that can burn the
-            # shared rate limit, so it is never a quiet flag.
-            out["override"] = {"by": self.override_by, "reason": self.override_reason}
-        if self.state == FAILED:
-            out["failure"] = {"step": self.failed_step, "detail": self.failure_detail,
-                              "retry_safe": self.retry_safe}
-        if self.job_id:
-            out["job_id"] = self.job_id
-        return out
-
-
-def verify(request: TenantRequest, resolver: Resolver) -> TenantRequest:
-    """Run the DNS gate and move the state accordingly."""
-    verdict = check_dns(request.tenant_id, request.base_domain, request.address, resolver)
-    request.dns = verdict
-    request.state = VERIFIED if verdict.ok else AWAITING_DNS
-    log.info("tenant %s DNS check: %s", request.tenant_id,
-             "passed" if verdict.ok else verdict.blocking_reason)
-    return request
-
-
-def override(request: TenantRequest, *, by: str, reason: str) -> TenantRequest:
-    """Force past the DNS gate, with a name attached.
-
-    Requires a reason as well as an actor, because this is the one path to
-    provisioning that can consume certificate issuance for every tenant on the
-    domain. A retry button would not need a reason; this is not a retry.
-    """
-    if not by:
-        raise TenantError("an override needs an actor")
-    if not reason:
-        raise TenantError(
-            "an override needs a reason: it is the one path to provisioning that "
-            "can exhaust certificate issuance for the whole deployment")
-    if request.state == LIVE:
-        raise TenantError("this tenant is already live")
-    request.override_by = by
-    request.override_reason = reason
-    request.state = VERIFIED
-    log.warning("tenant %s DNS gate OVERRIDDEN by %s: %s",
-                request.tenant_id, by, reason)
-    return request
 
 
 # ── the job handed to the runner (§5.3) ────────────────────────────────────
 
 
-def provisioning_job(request: TenantRequest, *, requested_by: str) -> dict:
+def provisioning_job(*, tenant_id: str, base_domain: str, address: str,
+                     initial_admin: str, hostnames: list[str], requested_by: str,
+                     dns_verified: bool, override_by: str = "",
+                     override_reason: str = "") -> dict:
     """What this application writes for the runner to claim.
 
     Parameters as STRUCTURED DATA, never a command line. §5.3.1: the tenant id
-    reaches four interpreters, so it goes to Ansible as JSON via --extra-vars and
-    is never interpolated into a shell string. This function returns the data; it
-    does not build a command, and nothing here knows how the runner invokes
-    anything.
+    reaches four interpreters, so it goes to Ansible as JSON via --extra-vars and is
+    never interpolated into a shell string. This returns the data; it does not build
+    a command, and nothing here knows how the runner invokes anything.
 
-    No credentials. The runner holds the vault password; this application holds
-    none and knows only that it asked.
+    No credentials. The runner holds the vault password; this application holds none
+    and knows only that it asked.
+
+    IT NO LONGER CHECKS THE GATE, and that is a strengthening rather than a
+    weakening. It used to refuse unless a request object said `verified`, which was a
+    check on a value this process had read earlier — so two callers could both pass
+    it. The gate is now the registry's conditional UPDATE, which either claims the
+    row or does not; this function is only reached once that has succeeded, and a
+    second opinion here could only ever disagree with the one that counts.
     """
-    if not request.may_provision:
-        raise TenantError(
-            f"tenant {request.tenant_id} is {request.state}, not verified — the DNS "
-            f"gate has not passed and has not been overridden. Provisioning now "
-            f"would fail at the certificate step and consume the domain's rate "
-            f"limit, which is shared by every tenant.")
     if not requested_by:
         raise TenantError("a provisioning job needs an actor")
     return {
         "playbook": "playbooks/tenant.yml",
         # Ansible reads these as --extra-vars JSON. No shell, no interpolation.
         "extra_vars": {
-            "tenant_id": request.tenant_id,
-            "tenant_admin": request.initial_admin,
-            "tenant_hostnames": request.hostnames,
+            "tenant_id": tenant_id,
+            "tenant_admin": initial_admin,
+            "tenant_hostnames": list(hostnames),
+            "tenant_base_domain": base_domain,
+            "tenant_address": address,
         },
         "requested_by": requested_by,
         "requested_at": _now(),
-        "tenant_id": request.tenant_id,
+        "tenant_id": tenant_id,
         # Carried so the runner's record shows the gate was passed rather than
         # bypassed, and if it was bypassed, BY WHOM AND WHY.
         #
-        # The reason was missing here at first while the actor was present, which
-        # got the emphasis backwards. If this run fails at the certificate step
-        # and consumes issuance for every tenant on the domain, the question is
-        # not who pressed it — that is in the audit trail either way — but what
-        # they believed was true about the zone. That is the only field that
-        # explains the decision to someone reading it afterwards.
-        "dns_verified": bool(request.dns and request.dns.ok),
-        "dns_overridden_by": request.override_by,
-        "dns_override_reason": request.override_reason,
+        # The reason was missing here at first while the actor was present, which got
+        # the emphasis backwards. If this run fails at the certificate step and
+        # consumes issuance for every tenant on the domain, the question is not who
+        # pressed it — that is in the audit trail either way — but what they believed
+        # was true about the zone.
+        "dns_verified": bool(dns_verified),
+        "dns_overridden_by": override_by,
+        "dns_override_reason": override_reason,
     }

@@ -16,7 +16,8 @@ const loading = ref(true)
 const creating = ref(false)
 const busy = ref('')
 
-const form = ref({ tenant_id: '', base_domain: '', address: '', initial_admin: '' })
+const form = ref({ tenant_id: '', base_domain: '', address: '', initial_admin: '',
+                   display_name: '' })
 
 const mayAct = computed(() => s.has(SYSTEM_TENANTS))
 
@@ -59,8 +60,10 @@ async function create() {
       base_domain: form.value.base_domain.trim(),
       address: form.value.address.trim(),
       initial_admin: form.value.initial_admin.trim(),
+      display_name: form.value.display_name.trim(),
     })
-    form.value = { tenant_id: '', base_domain: '', address: '', initial_admin: '' }
+    form.value = { tenant_id: '', base_domain: '', address: '', initial_admin: '',
+                   display_name: '' }
     creating.value = false
     await refresh()
   } catch (e) {
@@ -83,12 +86,30 @@ async function override(t: TenantView) {
   await act(t.tenant_id, () => tenants.dnsOverride(t.tenant_id, reason))
 }
 
+async function rename(t: TenantView) {
+  // The LABEL only. tenant_id reaches a hostname, a Postgres schema, an LDAP DN and
+  // a file path, so it is immutable — an organisation renaming itself must not move
+  // its data. The prompt says so, because "rename" invites the other expectation.
+  const name = window.prompt(
+    `Human-readable name for ${t.tenant_id}.\n\n` +
+      'Used for billing and high-level operations. The tenant id itself does not ' +
+      'change — nothing is keyed on this.',
+    t.has_display_name ? t.display_name : '',
+  )
+  if (name === null) return
+  await act(t.tenant_id, () => tenants.setDisplayName(t.tenant_id, name))
+}
+
 function stateClass(state: string) {
+  // The REGISTRY's vocabulary, which is the one the doors compare against.
   if (state === 'live') return 'ok'
-  if (state === 'failed') return 'bad'
-  // `awaiting_dns` and `requested` are WAITING, not broken. Colouring them red
-  // would report a tenant whose records simply have not propagated as an error.
-  if (state === 'awaiting_dns' || state === 'requested') return 'warn'
+  if (state === 'decommissioned') return 'bad'
+  // `awaiting_dns` and `requested` are WAITING, not broken: records that have not
+  // propagated are not a fault, and red would send someone looking for a problem
+  // that does not exist. `suspended` and `decommissioning` are deliberate acts, so
+  // they are flagged without being errors either.
+  if (state === 'awaiting_dns' || state === 'requested' || state === 'suspended'
+      || state === 'decommissioning' || state === 'provisioning') return 'warn'
   return ''
 }
 </script>
@@ -99,9 +120,10 @@ function stateClass(state: string) {
       <div>
         <h1>Tenants</h1>
         <p class="sub">
-          Requested here, provisioned by a runner. This console holds no DNS
-          credential and runs no playbook — it records what was asked and hands the
-          runner a job.
+          Every tenant in the registry — the core's <span class="mono">public.tenants</span>,
+          the same rows the doors read. Most predate this console and simply have no
+          creation details recorded here; that is normal. New ones are requested here
+          and provisioned by a runner, which holds the credentials this console does not.
         </p>
       </div>
       <button v-if="mayAct" class="btn" @click="creating = !creating">
@@ -123,6 +145,16 @@ function stateClass(state: string) {
             cannot be changed afterwards.
           </p>
         </div>
+        <div class="field">
+          <label for="dname">Name (optional)</label>
+          <input id="dname" v-model="form.display_name" placeholder="Acme Corporation Ltd" />
+          <p class="hint">
+            What a human calls them, for billing and high-level operations. Free text,
+            changeable later, and never used to look anything up.
+          </p>
+        </div>
+      </div>
+      <div class="pair">
         <div class="field">
           <label for="dom">Base domain</label>
           <input id="dom" v-model="form.base_domain" placeholder="example.com" />
@@ -152,22 +184,37 @@ function stateClass(state: string) {
         <tr>
           <th>Tenant</th>
           <th>State</th>
+          <th>Logins</th>
           <th>DNS</th>
-          <th>Requested by</th>
           <th v-if="mayAct" class="actions">Actions</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="t in rows" :key="t.tenant_id">
           <td>
-            <RouterLink :to="`/tenants/${t.tenant_id}`" class="tid">{{ t.tenant_id }}</RouterLink>
-            <div class="muted small">{{ t.base_domain }} → {{ t.address }}</div>
+            <RouterLink :to="`/tenants/${t.tenant_id}`" class="tid">
+              {{ t.display_name }}
+            </RouterLink>
+            <!-- The IDENTIFIER, always shown, in mono, even when a label exists. The
+                 label is what a human recognises and the id is what everything else
+                 uses; hiding the id would make the page unusable for the operations
+                 it exists for. -->
+            <div class="muted small mono">{{ t.tenant_id }}</div>
+            <div v-if="t.base_domain" class="muted small">
+              {{ t.base_domain }} → {{ t.address }}
+            </div>
           </td>
           <td>
             <span class="pill" :class="stateClass(t.state)">{{ t.state.replace('_', ' ') }}</span>
             <div v-if="t.override" class="muted small ovr">
               overridden by {{ t.override.by }}
             </div>
+          </td>
+          <td>
+            <!-- Derived from the registry state, not guessed: only `live` admits. -->
+            <span class="pill" :class="t.admits_logins ? 'ok' : ''">
+              {{ t.admits_logins ? 'admitted' : 'refused' }}
+            </span>
           </td>
           <td class="dns">
             <template v-if="t.dns">
@@ -176,15 +223,22 @@ function stateClass(state: string) {
             </template>
             <span v-else class="muted small">not checked</span>
           </td>
-          <td class="muted small">{{ t.requested_by }}</td>
           <td v-if="mayAct" class="actions">
             <div class="row">
               <button class="btn secondary sm" :disabled="busy === t.tenant_id"
+                      @click="rename(t)">
+                Name
+              </button>
+              <!-- Only offered where there is something to check against. A tenant
+                   that predates this console has no recorded domain, and the server
+                   says so with a 409 rather than reporting a DNS failure. -->
+              <button v-if="t.base_domain" class="btn secondary sm"
+                      :disabled="busy === t.tenant_id"
                       @click="act(t.tenant_id, () => tenants.dnsCheck(t.tenant_id))">
                 Check DNS
               </button>
-              <button class="btn secondary sm" :disabled="busy === t.tenant_id || t.state === 'live'"
-                      @click="override(t)">
+              <button v-if="!t.admits_logins && t.base_domain" class="btn secondary sm"
+                      :disabled="busy === t.tenant_id" @click="override(t)">
                 Override
               </button>
               <!--
@@ -199,7 +253,8 @@ function stateClass(state: string) {
                 request with one conditional UPDATE, so a double-click or a stale
                 page cannot queue two runs.
               -->
-              <button class="btn sm" :disabled="busy === t.tenant_id || !t.may_provision"
+              <button v-if="!t.admits_logins" class="btn sm"
+                      :disabled="busy === t.tenant_id || !t.may_provision"
                       :title="t.may_provision
                         ? 'Hand a provisioning job to the runner'
                         : 'The DNS gate has not passed and has not been overridden'"
