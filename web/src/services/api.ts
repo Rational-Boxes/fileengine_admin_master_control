@@ -109,6 +109,12 @@ export interface TenantView {
   gate_cleared: boolean
   /** False for every tenant that predates this console — the normal case. */
   requested_here: boolean
+  /** What the DOORS resolve this id to: the part before the first hyphen. */
+  base_tenant_id: string
+  /** False when the id contains a hyphen, so no request can ever arrive for it. */
+  reachable_by_hostname: boolean
+  /** Set on an unreachable row: the tenant whose hostname takes its traffic, or ''. */
+  shadowed_by?: string
   created_at: string
   state_since: string
   state_by: string

@@ -630,6 +630,8 @@ def build_router(config: Config, registry: AdministratorRegistry,
     _jobs: JobStore = jobs if jobs is not None else InMemoryJobStore()
     _resolver: Resolver = resolver if resolver is not None else StaticResolver(answers={})
 
+    _interfaces = config.interface_list()
+
     def _records_of(t) -> list:
         """The zone lines, derived rather than stored.
 
@@ -640,12 +642,12 @@ def build_router(config: Config, registry: AdministratorRegistry,
             return []
         return [{"name": rec.name, "type": rec.type, "value": rec.value,
                  "zone_line": rec.as_zone_line()}
-                for rec in records_for(t.tenant_id, t.base_domain, t.address)]
+                for rec in records_for(t.tenant_id, t.base_domain, t.address, _interfaces)]
 
     def _with_records(t) -> dict:
         out = t.for_display()
-        out["hostnames"] = (hostnames_for(t.tenant_id, t.base_domain)
-                            if t.base_domain else [])
+        out["hostnames"] = (hostnames_for(t.tenant_id, t.base_domain, _interfaces)
+                            if t.base_domain and t.reachable_by_hostname else [])
         out["records"] = _records_of(t)
         return out
 
@@ -710,7 +712,26 @@ def build_router(config: Config, registry: AdministratorRegistry,
         that is the normal case rather than a gap.
         """
         try:
-            return {"tenants": [_with_records(t) for t in _registry.list()]}
+            rows = _registry.list()
+        except RegistryUnavailable as e:
+            # NOT an empty list, which would report an estate with no tenants.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+
+        # Which ids actually exist, so an unreachable row can say whether its
+        # hostname goes to a real tenant or to nothing at all. The two cases need
+        # different responses: `filenginetest-drive` is shadowed by a live tenant and
+        # is harmless clutter, while `fileenginetest-drive` — a typo nobody owns —
+        # points its traffic at a tenant that does not exist.
+        present = {t.tenant_id for t in rows}
+        out = []
+        for t in rows:
+            shown = _with_records(t)
+            if not t.reachable_by_hostname:
+                shown["shadowed_by"] = t.base_tenant_id if t.base_tenant_id in present else ""
+            out.append(shown)
+        try:
+            return {"tenants": out}
         except RegistryUnavailable as e:
             # NOT an empty list, which would report an estate with no tenants.
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -765,7 +786,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
                 detail=f"{tenant_id} has no recorded base domain or address — it was "
                        f"not requested through this console, so there is nothing to "
                        f"check its DNS against.")
-        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver)
+        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver, _interfaces)
         try:
             t = _registry.record_dns(tenant_id, {
                 "ok": verdict.ok, "authoritative": verdict.authoritative,
@@ -865,7 +886,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         job = provisioning_job(
             tenant_id=claimed.tenant_id, base_domain=claimed.base_domain,
             address=claimed.address, initial_admin=claimed.initial_admin,
-            hostnames=hostnames_for(claimed.tenant_id, claimed.base_domain)
+            hostnames=hostnames_for(claimed.tenant_id, claimed.base_domain, _interfaces)
             if claimed.base_domain else [],
             requested_by=principal.subject,
             dns_verified=bool((before.dns or {}).get("ok")),

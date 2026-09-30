@@ -3,7 +3,7 @@
   SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { apiError } from '@/services/client'
 import { tenants, type TenantView } from '@/services/api'
@@ -19,7 +19,133 @@ const busy = ref('')
 const form = ref({ tenant_id: '', base_domain: '', address: '', initial_admin: '',
                    display_name: '' })
 
+const query = ref('')
+const stateFilter = ref('')
+const pageSize = ref(50)
+const page = ref(1)
+
+// RESET TO PAGE ONE WHENEVER THE FILTER CHANGES. Without this, typing a search while
+// on page 5 leaves you on page 5 of a one-page result — an empty table that looks
+// like "no matches" and is really "no such page". The same applies to changing the
+// page size, which can shrink the number of pages under your feet.
+watch([query, stateFilter, pageSize], () => {
+  page.value = 1
+})
+
+/** Plain substring matching, not a regex.
+ *
+ * `String.includes` on a lower-cased needle: a tenant id or a company name typed into
+ * a box is not a pattern, and treating it as one would make a stray `(` throw and a
+ * `.` match everything. Matches the IDENTIFIER and the LABEL both, because someone
+ * looking for "Rational Boxes Ltd" and someone looking for "rationalboxes" are both
+ * looking for the same tenant.
+ */
+function matches(t: TenantView): boolean {
+  if (stateFilter.value && t.state !== stateFilter.value) return false
+  const q = query.value.trim().toLowerCase()
+  if (!q) return true
+  return (
+    t.tenant_id.toLowerCase().includes(q) ||
+    t.display_name.toLowerCase().includes(q) ||
+    t.base_domain.toLowerCase().includes(q)
+  )
+}
+
+/** The states actually present, so the filter offers nothing that returns zero rows. */
+const statesPresent = computed(() =>
+  [...new Set(rows.value.map((t) => t.state))].sort(),
+)
+
 const mayAct = computed(() => s.has(SYSTEM_TENANTS))
+
+/** Tenants, with interface-shaped rows FOLDED UNDER the tenant they belong to.
+ *
+ * `filenginetest-drive` is not a tenant. It is the WebDAV HOSTNAME of tenant
+ * `filenginetest`, which the core registered as a tenant because it auto-registers
+ * anything it is asked about — so browsing to that host created one. The doors split
+ * the leading DNS label on '-' and keep the first segment, so no request can ever
+ * arrive for it: the row and its schema are real, but the tenant is not.
+ *
+ * Folded rather than hidden. An unreachable schema that may hold data is exactly what
+ * this console exists to surface, and there is no button here that could remove it —
+ * decommissioning is a later phase behind its own re-authentication.
+ *
+ * The suffix is not a fixed list. The bridge treats everything after the first hyphen
+ * as an interface (`acme-staging` resolves to `acme` too), and each interface is a
+ * real subdomain with its own A record and its own certificate — which is why the set
+ * is configured server-side and this view only groups what it is told.
+ */
+/** Every tenant, grouped, before any filter. The denominator in "showing X of Y". */
+const allGroups = computed(() => {
+  const byId = new Map(rows.value.map((t) => [t.tenant_id, t]))
+  const children = new Map<string, TenantView[]>()
+  const top: TenantView[] = []
+  for (const t of rows.value) {
+    if (!t.reachable_by_hostname && byId.has(t.base_tenant_id)) {
+      const list = children.get(t.base_tenant_id) ?? []
+      list.push(t)
+      children.set(t.base_tenant_id, list)
+    } else {
+      top.push(t)
+    }
+  }
+  return top.map((t) => ({ tenant: t, folded: children.get(t.tenant_id) ?? [] }))
+})
+
+/** The filtered view.
+ *
+ * FILTERED AFTER GROUPING, and a group is kept when the parent OR any of its interface
+ * rows match. Filtering the flat list first would strip a parent whose child matched
+ * and leave that child with nothing to fold under — so searching "filenginetest-drive"
+ * would either show it as a top-level tenant, which is the misreading this whole view
+ * exists to correct, or drop it entirely.
+ *
+ * Once a group is kept, ALL of its interfaces are shown: hiding one for not matching
+ * the text would misreport how many hostnames a tenant has.
+ */
+const grouped = computed(() =>
+  allGroups.value.filter((g) => matches(g.tenant) || g.folded.some(matches)),
+)
+
+/** Pagination over the GROUPS, not the rows.
+ *
+ * A page boundary must never fall between a tenant and its interface rows — a page
+ * ending on `filenginetest` with `filenginetest-drive` at the top of the next one
+ * would show the folded row with no parent above it, which is exactly the reading this
+ * view exists to prevent. Counting groups makes that impossible rather than unlikely.
+ *
+ * 0 means "all": with 218 tenants a single page is slow to scan but sometimes it is
+ * what you want, and the choice costs nothing.
+ */
+const pageCount = computed(() =>
+  pageSize.value === 0 ? 1 : Math.max(1, Math.ceil(grouped.value.length / pageSize.value)),
+)
+
+const paged = computed(() => {
+  if (pageSize.value === 0) return grouped.value
+  // Clamped rather than trusted: a stale `page` after a filter change would otherwise
+  // slice past the end and render nothing.
+  const current = Math.min(page.value, pageCount.value)
+  const from = (current - 1) * pageSize.value
+  return grouped.value.slice(from, from + pageSize.value)
+})
+
+const firstShown = computed(() =>
+  grouped.value.length === 0 ? 0
+    : pageSize.value === 0 ? 1
+      : (Math.min(page.value, pageCount.value) - 1) * pageSize.value + 1,
+)
+const lastShown = computed(() => firstShown.value + paged.value.length - 1)
+
+/** Unreachable rows with no tenant to fold under — a worse case, and a different one.
+ *
+ * `fileenginetest-drive` (note the spelling) has no `fileenginetest` to belong to, so
+ * its hostname points at a tenant that does not exist. Left at the top level, because
+ * folding it somewhere would be inventing a parent.
+ */
+const orphans = computed(() =>
+  rows.value.filter((t) => !t.reachable_by_hostname && !t.shadowed_by),
+)
 
 onMounted(refresh)
 
@@ -177,7 +303,61 @@ function stateClass(state: string) {
     </form>
 
     <p v-if="loading" class="empty">Loading…</p>
-    <p v-else-if="!rows.length" class="empty">No tenant requests on record.</p>
+    <p v-else-if="!rows.length" class="empty">
+      No tenants in the registry. If the estate is not empty, check that
+      AMC_CORE_PG_* points at the core's database.
+    </p>
+    <p v-else-if="!grouped.length" class="empty">
+      Nothing matches. <button class="link" @click="query = ''; stateFilter = ''">Clear
+      the filter</button> to see all {{ rows.length }}.
+    </p>
+
+    <div v-if="!loading && rows.length" class="row filters">
+      <div class="field grow">
+        <label for="q">Search</label>
+        <input id="q" v-model="query" type="search"
+               placeholder="tenant id, name, or domain" />
+      </div>
+      <div class="field">
+        <label for="st">State</label>
+        <select id="st" v-model="stateFilter">
+          <option value="">any</option>
+          <option v-for="st in statesPresent" :key="st" :value="st">
+            {{ st.replace(/_/g, ' ') }}
+          </option>
+        </select>
+      </div>
+      <!-- The count is part of the filter, not decoration: on an estate of this size
+           "showing 3" and "showing 218" look identical without it, and a filter left
+           set is the commonest reason a tenant appears to be missing. -->
+      <div class="field">
+        <label for="per">Per page</label>
+        <select id="per" v-model.number="pageSize">
+          <option :value="25">25</option>
+          <option :value="50">50</option>
+          <option :value="100">100</option>
+          <option :value="0">all</option>
+        </select>
+      </div>
+      <!-- The count is part of the filter, not decoration: on an estate of this size
+           "showing 3" and "showing 218" look identical without it, and a filter left
+           set is the commonest reason a tenant appears to be missing. -->
+      <p class="count muted">
+        {{ grouped.length ? `${firstShown}–${lastShown} of ${grouped.length}` : '0' }}
+        <template v-if="grouped.length !== allGroups.length">
+          (filtered from {{ allGroups.length }})
+        </template>
+        <button v-if="query || stateFilter" class="link"
+                @click="query = ''; stateFilter = ''">clear</button>
+      </p>
+    </div>
+
+    <p v-if="orphans.length" class="notice warn">
+      {{ orphans.length }} registry row{{ orphans.length === 1 ? '' : 's' }}
+      {{ orphans.length === 1 ? 'has' : 'have' }} an interface-shaped id with no tenant
+      to belong to — their hostnames resolve to a tenant that does not exist, so nothing
+      can reach them. They hold a schema and cannot be removed from here.
+    </p>
 
     <table v-else class="card">
       <thead>
@@ -190,82 +370,120 @@ function stateClass(state: string) {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="t in rows" :key="t.tenant_id">
-          <td>
-            <RouterLink :to="`/tenants/${t.tenant_id}`" class="tid">
-              {{ t.display_name }}
-            </RouterLink>
-            <!-- The IDENTIFIER, always shown, in mono, even when a label exists. The
-                 label is what a human recognises and the id is what everything else
-                 uses; hiding the id would make the page unusable for the operations
-                 it exists for. -->
-            <div class="muted small mono">{{ t.tenant_id }}</div>
-            <div v-if="t.base_domain" class="muted small">
-              {{ t.base_domain }} → {{ t.address }}
-            </div>
-          </td>
-          <td>
-            <span class="pill" :class="stateClass(t.state)">{{ t.state.replace('_', ' ') }}</span>
-            <div v-if="t.override" class="muted small ovr">
-              overridden by {{ t.override.by }}
-            </div>
-          </td>
-          <td>
-            <!-- Derived from the registry state, not guessed: only `live` admits. -->
-            <span class="pill" :class="t.admits_logins ? 'ok' : ''">
-              {{ t.admits_logins ? 'admitted' : 'refused' }}
-            </span>
-          </td>
-          <td class="dns">
-            <template v-if="t.dns">
-              <span v-if="t.dns.ok" class="pill ok">verified</span>
-              <div v-else class="muted small">{{ t.dns.blocking_reason }}</div>
-            </template>
-            <span v-else class="muted small">not checked</span>
-          </td>
-          <td v-if="mayAct" class="actions">
-            <div class="row">
-              <button class="btn secondary sm" :disabled="busy === t.tenant_id"
-                      @click="rename(t)">
-                Name
-              </button>
-              <!-- Only offered where there is something to check against. A tenant
-                   that predates this console has no recorded domain, and the server
-                   says so with a 409 rather than reporting a DNS failure. -->
-              <button v-if="t.base_domain" class="btn secondary sm"
-                      :disabled="busy === t.tenant_id"
-                      @click="act(t.tenant_id, () => tenants.dnsCheck(t.tenant_id))">
-                Check DNS
-              </button>
-              <button v-if="!t.admits_logins && t.base_domain" class="btn secondary sm"
-                      :disabled="busy === t.tenant_id" @click="override(t)">
-                Override
-              </button>
-              <!--
-                THE GATE. `:disabled` is bound to `t.may_provision` — the SERVER'S
-                judgement, carried in the response — and never to a condition
-                computed here. A local `state === 'verified' || override` looks
-                identical and is a second implementation of the rule that protects
-                a rate limit shared by every tenant on the domain; when the two
-                disagree the button is enabled and the server is right.
+        <template v-for="g in paged" :key="g.tenant.tenant_id">
+          <tr>
+            <td>
+              <RouterLink :to="`/tenants/${g.tenant.tenant_id}`" class="tid">
+                {{ g.tenant.display_name }}
+              </RouterLink>
+              <!-- The IDENTIFIER, always shown, even when a label exists: the label is
+                   what a human recognises and the id is what every other system uses. -->
+              <div class="muted small mono">{{ g.tenant.tenant_id }}</div>
+              <div v-if="g.tenant.base_domain" class="muted small">
+                {{ g.tenant.base_domain }} → {{ g.tenant.address }}
+              </div>
+              <!-- Each interface is a separate subdomain with its own A record and its
+                   own certificate, so they are listed as HOSTNAMES of this tenant. -->
+              <div v-if="g.tenant.hostnames.length > 1" class="muted small ifaces">
+                {{ g.tenant.hostnames.length }} interfaces:
+                <span class="mono">{{ g.tenant.hostnames.join(', ') }}</span>
+              </div>
+            </td>
+            <td>
+              <span class="pill" :class="stateClass(g.tenant.state)">
+                {{ g.tenant.state.replace(/_/g, ' ') }}
+              </span>
+              <div v-if="g.tenant.override" class="muted small ovr">
+                overridden by {{ g.tenant.override.by }}
+              </div>
+            </td>
+            <td>
+              <span class="pill" :class="g.tenant.admits_logins ? 'ok' : ''">
+                {{ g.tenant.admits_logins ? 'admitted' : 'refused' }}
+              </span>
+            </td>
+            <td class="dns">
+              <template v-if="g.tenant.dns">
+                <span v-if="g.tenant.dns.ok" class="pill ok">verified</span>
+                <div v-else class="muted small">{{ g.tenant.dns.blocking_reason }}</div>
+              </template>
+              <span v-else class="muted small">not checked</span>
+            </td>
+            <td v-if="mayAct" class="actions">
+              <div class="row">
+                <button class="btn secondary sm" :disabled="busy === g.tenant.tenant_id"
+                        @click="rename(g.tenant)">
+                  Name
+                </button>
+                <button v-if="g.tenant.base_domain" class="btn secondary sm"
+                        :disabled="busy === g.tenant.tenant_id"
+                        @click="act(g.tenant.tenant_id, () => tenants.dnsCheck(g.tenant.tenant_id))">
+                  Check DNS
+                </button>
+                <button v-if="!g.tenant.admits_logins && g.tenant.base_domain"
+                        class="btn secondary sm" :disabled="busy === g.tenant.tenant_id"
+                        @click="override(g.tenant)">
+                  Override
+                </button>
+                <!--
+                  THE GATE. `:disabled` is bound to `may_provision` — the SERVER'S
+                  judgement, carried in the response — and never to a condition computed
+                  here. A local `state === 'awaiting_dns' && gate_cleared` looks
+                  identical and is a second implementation of the rule protecting a
+                  certificate rate limit shared by every tenant on the domain; when the
+                  two disagree the button is enabled and the server is right.
 
-                Disabling it is a courtesy, not the control: the server claims the
-                request with one conditional UPDATE, so a double-click or a stale
-                page cannot queue two runs.
-              -->
-              <button v-if="!t.admits_logins" class="btn sm"
-                      :disabled="busy === t.tenant_id || !t.may_provision"
-                      :title="t.may_provision
-                        ? 'Hand a provisioning job to the runner'
-                        : 'The DNS gate has not passed and has not been overridden'"
-                      @click="act(t.tenant_id, () => tenants.provision(t.tenant_id))">
-                Provision
-              </button>
-            </div>
-          </td>
-        </tr>
+                  Disabling it is a courtesy, not the control: the server claims the
+                  registry row with one conditional UPDATE, so a double click or a stale
+                  page cannot queue two runs.
+                -->
+                <button v-if="!g.tenant.admits_logins" class="btn sm"
+                        :disabled="busy === g.tenant.tenant_id || !g.tenant.may_provision"
+                        :title="g.tenant.may_provision
+                          ? 'Hand a provisioning job to the runner'
+                          : 'The DNS gate has not passed and has not been overridden'"
+                        @click="act(g.tenant.tenant_id, () => tenants.provision(g.tenant.tenant_id))">
+                  Provision
+                </button>
+              </div>
+            </td>
+          </tr>
+          <!-- Folded: registry rows that are an INTERFACE HOSTNAME of the tenant above,
+               not tenants of their own. No request can arrive for them; the schema is
+               real and there is nothing here that can remove it. -->
+          <tr v-for="c in g.folded" :key="c.tenant_id" class="folded">
+            <td colspan="4">
+              <span class="mono">{{ c.tenant_id }}</span>
+              <span class="pill warn">not a tenant</span>
+              <div class="muted small">
+                An interface hostname of <span class="mono">{{ g.tenant.tenant_id }}</span>,
+                registered as a tenant because the core registers any tenant it is asked
+                about. Nothing can reach it — the doors resolve
+                <span class="mono">{{ c.tenant_id }}.&lt;domain&gt;</span> to
+                <span class="mono">{{ g.tenant.tenant_id }}</span> — but it holds the
+                schema <span class="mono">{{ c.schema_name }}</span>.
+              </div>
+            </td>
+            <td v-if="mayAct"></td>
+          </tr>
+        </template>
       </tbody>
     </table>
+
+    <nav v-if="pageCount > 1" class="pager">
+      <button class="btn secondary sm" :disabled="page <= 1" @click="page = 1">First</button>
+      <button class="btn secondary sm" :disabled="page <= 1" @click="page -= 1">
+        Previous
+      </button>
+      <span class="muted">Page {{ Math.min(page, pageCount) }} of {{ pageCount }}</span>
+      <button class="btn secondary sm" :disabled="page >= pageCount" @click="page += 1">
+        Next
+      </button>
+      <button class="btn secondary sm" :disabled="page >= pageCount"
+              @click="page = pageCount">
+        Last
+      </button>
+    </nav>
   </div>
 </template>
 
@@ -295,6 +513,47 @@ function stateClass(state: string) {
 }
 .ovr {
   margin-top: 0.25rem;
+}
+.ifaces {
+  margin-top: 0.25rem;
+}
+.filters {
+  align-items: flex-end;
+  margin-bottom: 1rem;
+}
+.filters .field {
+  margin-bottom: 0;
+  width: 180px;
+}
+.filters .field.grow {
+  flex: 1;
+  min-width: 220px;
+}
+.count {
+  font-size: 0.8rem;
+  margin: 0 0 0.35rem;
+  white-space: nowrap;
+}
+.count .link {
+  margin-left: 0.4rem;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+tr.folded td {
+  padding-top: 0.35rem;
+  padding-bottom: 0.6rem;
+  padding-left: 1.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+tr.folded .pill {
+  margin-left: 0.5rem;
 }
 .tid {
   color: var(--primary);

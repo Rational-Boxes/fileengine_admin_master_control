@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from .config import Config
+from .tenants import base_tenant_id, reachable_by_hostname
 
 log = logging.getLogger("admin_master_control.registry")
 
@@ -147,6 +148,29 @@ class Tenant:
         return self.state == ADMITS
 
     @property
+    def base_tenant_id(self) -> str:
+        """What the DOORS would resolve this id to — the part before the first hyphen.
+
+        Equal to `tenant_id` for a well-formed one. When it differs, this row cannot
+        be reached as itself: the doors split the leading DNS label on '-' and keep
+        the first segment, because the label follows `<tenant>-<interface>`.
+        """
+        return base_tenant_id(self.tenant_id)
+
+    @property
+    def reachable_by_hostname(self) -> bool:
+        """False for a row whose id contains a hyphen.
+
+        These exist — `filenginetest-drive` is in the registry — because the core
+        auto-registers any tenant it is asked about, so browsing to a WebDAV host
+        created a tenant out of an interface suffix. The row and its schema are real;
+        what is not real is the tenant, because no request can ever arrive for it.
+        Surfaced rather than hidden: an unreachable schema holding data is exactly the
+        kind of thing this console exists to show.
+        """
+        return reachable_by_hostname(self.tenant_id)
+
+    @property
     def gate_cleared(self) -> bool:
         """The same predicate the claim uses, for display.
 
@@ -173,6 +197,9 @@ class Tenant:
             "admits_logins": self.admits_logins,
             "may_provision": self.may_provision,
             "gate_cleared": self.gate_cleared,
+            # What the doors would resolve this id to, and whether that is itself.
+            "base_tenant_id": self.base_tenant_id,
+            "reachable_by_hostname": self.reachable_by_hostname,
             "created_at": self.created_at,
             "state_since": self.state_since,
             "state_by": self.state_by,

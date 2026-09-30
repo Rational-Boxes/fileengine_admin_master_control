@@ -60,10 +60,28 @@ log = logging.getLogger("admin_master_control.tenants")
 #: and a container label — a crafted value reaches four interpreters. Validated
 #: at the boundary, and parameters are passed to Ansible as JSON via
 #: --extra-vars, never interpolated into a command line.
-TENANT_ID = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+# NO HYPHENS, and this is a reachability rule rather than a style one.
+#
+# The doors resolve a tenant from the leading DNS label by splitting on '-' and
+# keeping the FIRST segment, because the label follows `<tenant>-<interface>`:
+#
+#     acme.example.com          -> acme
+#     acme-drive.example.com    -> acme        (WebDAV)
+#     acme-staging.example.com  -> acme        (anything after the hyphen)
+#
+# So a tenant id containing a hyphen can never be reached as itself. `acme-corp`
+# would be UNREACHABLE, and `acme-corp.example.com` would serve tenant `acme` —
+# which means naming a tenant that way hands its users somebody else's data. The
+# suffix is not a fixed list (the bridge treats everything after the first hyphen as
+# an interface), so an allow-list of known suffixes would not help.
+#
+# The registry contains rows like `filenginetest-drive` from before this validation
+# existed: the core auto-registers any tenant it is asked about, so browsing to a
+# WebDAV host created a tenant out of the interface suffix. Reading those back does
+# NOT go through this function — an existing row must remain visible, and the console
+# surfaces it as unreachable rather than hiding it.
+TENANT_ID = re.compile(r"^[a-z][a-z0-9]{1,30}$")
 
-#: Names that must never become a tenant, because the platform already uses them
-#: as hostnames. A tenant called `login` would shadow the sign-in origin.
 RESERVED_IDS = frozenset({
     "login", "www", "api", "mcp", "admin", "docs", "cms", "dav", "drive",
     "default",   # exists on every deployment
@@ -96,6 +114,21 @@ class TenantError(ValueError):
     """A request the platform will not accept."""
 
 
+def base_tenant_id(tenant_id: str) -> str:
+    """What the DOORS would resolve this id to: the part before the first hyphen.
+
+    Equal to `tenant_id` for a well-formed one. When it differs, the row is
+    unreachable by hostname and the traffic for its host goes to the returned id
+    instead.
+    """
+    return tenant_id.split("-", 1)[0]
+
+
+def reachable_by_hostname(tenant_id: str) -> bool:
+    """Whether the doors would resolve this id to itself."""
+    return bool(tenant_id) and base_tenant_id(tenant_id) == tenant_id
+
+
 def validate_tenant_id(tenant_id: str) -> str:
     """§5.3.1's strict pattern, applied at the boundary."""
     if not tenant_id:
@@ -110,17 +143,57 @@ def validate_tenant_id(tenant_id: str) -> str:
     return tenant_id
 
 
-def hostnames_for(tenant_id: str, base_domain: str) -> list[str]:
+#: The interfaces a tenant is served on, as hostname suffixes. `""` is the tenant's
+#: own host (the SPA and REST API); the rest follow the `<tenant>-<interface>`
+#: convention that the doors resolve back to the tenant.
+#:
+#: EACH ONE IS A SEPARATE SUBDOMAIN needing its own A record and its own certificate.
+#: That is the whole reason this list exists rather than being two hardcoded strings:
+#: adding an interface adds a record the zone must carry and a certificate the
+#: playbook must obtain, so the DNS gate has to know about it or the run gets through
+#: the first certificate and stops on the second — half done, and having spent
+#: issuance from a limit shared by every tenant on the domain.
+#:
+#: WebDAV has its own host because its verbs cannot sit behind a path prefix. MCP and
+#: the document server are path-routable today and so do not, but that is a current
+#: fact and not a permanent one; when either needs a host, adding it here is the whole
+#: change, and every tenant's record set and DNS gate follow.
+DEFAULT_INTERFACES = ("", "drive")
+
+
+def interface_suffixes(configured: str = "") -> tuple[str, ...]:
+    """Parse a configured interface list, always including the tenant's own host.
+
+    The bare host is not optional — a tenant that resolves only on `-drive` is not
+    reachable — so it is added whether or not it was configured.
+    """
+    if not configured.strip():
+        return DEFAULT_INTERFACES
+    out = [""]
+    for part in configured.split(","):
+        name = part.strip().lower().lstrip("-")
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def hostname_for(tenant_id: str, base_domain: str, suffix: str = "") -> str:
+    label = f"{tenant_id}-{suffix}" if suffix else tenant_id
+    return f"{label}.{base_domain}"
+
+
+def hostnames_for(tenant_id: str, base_domain: str,
+                  interfaces: tuple[str, ...] = DEFAULT_INTERFACES) -> list[str]:
     """Every hostname the tenant needs, which is what the DNS check must cover.
 
-    A missing `<tenant>-drive` "fails later and less legibly" (§3.4a) — the
-    playbook gets through the first certificate and stops on the second, by which
-    point the run is half done.
+    A missing `<tenant>-drive` "fails later and less legibly" (§3.4a) — the playbook
+    gets through the first certificate and stops on the second, by which point the run
+    is half done and the domain's issuance limit has been spent.
     """
     validate_tenant_id(tenant_id)
     if not base_domain:
         raise TenantError("a base domain is required")
-    return [f"{tenant_id}.{base_domain}", f"{tenant_id}-drive.{base_domain}"]
+    return [hostname_for(tenant_id, base_domain, sfx) for sfx in interfaces]
 
 
 @dataclass(frozen=True)
@@ -135,13 +208,18 @@ class DnsRecord:
         return f"{self.name}.\t300\tIN\t{self.type}\t{self.value}"
 
 
-def records_for(tenant_id: str, base_domain: str, address: str) -> list[DnsRecord]:
-    """Exactly the records to create, in a form meant for pasting (§3.4a step 1)."""
+def records_for(tenant_id: str, base_domain: str, address: str,
+                interfaces: tuple[str, ...] = DEFAULT_INTERFACES) -> list[DnsRecord]:
+    """Exactly the records to create, in a form meant for pasting (§3.4a step 1).
+
+    One per interface, because each is its own subdomain and needs its own record
+    before its own certificate can be issued.
+    """
     if not address:
         raise TenantError("the address these records must point at is required")
     rtype = "AAAA" if ":" in address else "A"
     return [DnsRecord(name=h, type=rtype, value=address)
-            for h in hostnames_for(tenant_id, base_domain)]
+            for h in hostnames_for(tenant_id, base_domain, interfaces)]
 
 
 # ── the DNS gate ───────────────────────────────────────────────────────────
@@ -246,7 +324,8 @@ class StaticResolver:
 
 
 def check_dns(tenant_id: str, base_domain: str, address: str,
-              resolver: Resolver) -> DnsVerdict:
+              resolver: Resolver,
+              interfaces: tuple[str, ...] = DEFAULT_INTERFACES) -> DnsVerdict:
     """The gate. Passes only on an authoritative answer matching the address for
     EVERY hostname.
 
@@ -261,7 +340,7 @@ def check_dns(tenant_id: str, base_domain: str, address: str,
     """
     checks: list[HostCheck] = []
     all_authoritative = True
-    for host in hostnames_for(tenant_id, base_domain):
+    for host in hostnames_for(tenant_id, base_domain, interfaces):
         addrs, authoritative, detail = resolver.addresses(host)
         all_authoritative = all_authoritative and authoritative
         matches = address in addrs

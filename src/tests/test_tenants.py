@@ -56,7 +56,7 @@ def _ready(tenant_id="acme", base=BASE, address=ADDR, **kw) -> t.StaticResolver:
 
 
 def test_a_tenant_id_is_a_narrow_shape():
-    for good in ("acme", "acme-corp", "a1", "x" * 31):
+    for good in ("acme", "acmecorp", "a1", "x" * 31):
         assert t.validate_tenant_id(good) == good
 
 
@@ -66,6 +66,17 @@ def test_a_tenant_id_is_a_narrow_shape():
     "1acme",                # must start with a letter
     "-acme",
     "acme_corp",            # underscore is not valid in a hostname label
+    # A HYPHEN is refused, and this is the one on the list that is a reachability
+    # bug rather than a syntax one. The doors split the leading DNS label on '-' and
+    # keep the first segment (`<tenant>-<interface>`, e.g. `acme-drive` for WebDAV),
+    # so `acme-corp` can never be reached as itself — and `acme-corp.example.com`
+    # would serve tenant `acme`, handing its users somebody else's data.
+    #
+    # This test asserted acme-corp was VALID until 2026-09-30. The registry still
+    # holds rows like `filenginetest-drive` created before the rule was enforced,
+    # because the core auto-registers any tenant it is asked about.
+    "acme-corp",
+    "acme-drive",
     "acme.corp",            # would create a second DNS label
     "x" * 32,               # hostname label limit
     "acme corp",
@@ -242,3 +253,90 @@ def test_the_job_no_longer_second_guesses_the_gate():
     # No state argument exists to be wrong about.
     assert "state" not in _job()
     assert _job(dns_verified=False)["extra_vars"]["tenant_id"] == "acme"
+
+
+# ── what the doors would resolve an id to ──────────────────────────────────
+
+
+def test_the_base_id_is_what_the_doors_resolve_to():
+    # The bridge splits the leading label on '-' and keeps the first segment. The
+    # suffix is NOT a fixed list — its own comment gives `acme-staging` as well as
+    # `acme-drive` — so this is a split, not a lookup.
+    assert t.base_tenant_id("acme") == "acme"
+    assert t.base_tenant_id("acme-drive") == "acme"
+    assert t.base_tenant_id("acme-staging") == "acme"
+    assert t.base_tenant_id("acme-a-b") == "acme"
+
+
+def test_a_hyphenated_id_is_not_reachable_as_itself():
+    assert t.reachable_by_hostname("acme")
+    assert not t.reachable_by_hostname("acme-drive")
+    assert not t.reachable_by_hostname("filenginetest-drive")
+    assert not t.reachable_by_hostname("")
+
+
+def test_every_id_this_console_will_now_create_is_reachable():
+    # The validator and the reachability rule have to agree, or the console creates
+    # tenants nobody can reach. Asserted as a property rather than by example.
+    for good in ("acme", "acmecorp", "a1", "x" * 31):
+        assert t.reachable_by_hostname(t.validate_tenant_id(good))
+
+
+# ── the interfaces: each is its own subdomain, DNS and certificate ─────────
+#
+# `<tenant>-drive` is not a naming flourish — it is a separate hostname that needs its
+# own A record and its own certificate. That is why the set is configured rather than
+# hardcoded: adding one adds a record the zone must carry and a certificate the
+# playbook must obtain, and a hostname the gate does not know about is one the run
+# still tries to certify, failing on it after the earlier certificates have already
+# spent issuance from a limit shared by every tenant on the domain.
+
+
+def test_the_default_interfaces_are_the_tenant_host_and_webdav():
+    assert t.DEFAULT_INTERFACES == ("", "drive")
+    assert t.hostnames_for("acme", BASE) == [f"acme.{BASE}", f"acme-drive.{BASE}"]
+
+
+def test_the_tenant_own_host_is_always_included():
+    # A tenant that resolves only on -drive is not reachable, so the bare host is not
+    # optional however the list is configured.
+    assert t.interface_suffixes("drive")[0] == ""
+    assert t.interface_suffixes("mcp,docs")[0] == ""
+    assert t.interface_suffixes("")[0] == ""
+
+
+def test_adding_an_interface_adds_a_hostname_a_record_and_a_check():
+    ifaces = t.interface_suffixes("drive,mcp,docs")
+    assert t.hostnames_for("acme", BASE, ifaces) == [
+        f"acme.{BASE}", f"acme-drive.{BASE}", f"acme-mcp.{BASE}", f"acme-docs.{BASE}"]
+    # A record for each, because each needs its own certificate.
+    assert [r.name for r in t.records_for("acme", BASE, ADDR, ifaces)] == \
+        t.hostnames_for("acme", BASE, ifaces)
+    # And the gate covers every one of them.
+    v = t.check_dns("acme", BASE, ADDR, t.StaticResolver(answers={}), ifaces)
+    assert len(v.checks) == 4
+
+
+def test_a_new_interface_is_blocking_until_its_record_exists():
+    # The point of threading the list through the gate: an interface nobody has created
+    # a record for must STOP provisioning, not be discovered at the certificate step.
+    ifaces = t.interface_suffixes("drive,mcp")
+    ready_three = t.StaticResolver(
+        answers={h: (ADDR,) for h in t.hostnames_for("acme", BASE, ifaces)[:2]})
+    v = t.check_dns("acme", BASE, ADDR, ready_three, ifaces)
+    assert not v.ok
+    assert f"acme-mcp.{BASE}" in v.blocking_reason
+
+
+def test_the_suffix_list_is_forgiving_of_how_it_is_written():
+    for spelling in ("drive", " drive ", "-drive", "DRIVE", "drive,drive"):
+        assert t.interface_suffixes(spelling) == ("", "drive"), spelling
+
+
+def test_an_interface_suffix_is_not_a_tenant():
+    # `acme-drive` is a hostname of tenant `acme`. It is not a tenant, and the
+    # validator now refuses it — which is what stops the console creating the very
+    # rows the registry already holds from before the rule existed.
+    with pytest.raises(t.TenantError):
+        t.validate_tenant_id("acme-drive")
+    assert t.base_tenant_id("acme-drive") == "acme"

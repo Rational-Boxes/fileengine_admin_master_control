@@ -217,6 +217,27 @@ class Config:
     # it when it is on, the same way it reports MFA being disabled.
     serve_api_docs: bool = field(default_factory=lambda: _bool("AMC_SERVE_API_DOCS", False))
 
+    # The interfaces every tenant is served on, as hostname suffixes, comma
+    # separated. The tenant's own host is always included whether listed or not.
+    #
+    # EACH IS A SEPARATE SUBDOMAIN with its own A record and its own certificate, so
+    # this list decides what the DNS gate requires and what the zone must carry.
+    # Adding one here is the whole change: every tenant's record set and every DNS
+    # check follow it. Getting it wrong in the other direction is expensive — a
+    # hostname the gate does not know about is one the playbook still tries to
+    # certify, and it fails on that certificate after the earlier ones have already
+    # spent issuance from a limit shared by every tenant on the domain.
+    #
+    # `drive` is WebDAV, which needs its own host because its verbs cannot sit behind
+    # a path prefix. MCP and the document server are path-routable today; when either
+    # needs a host of its own, it goes here.
+    tenant_interfaces: str = field(default_factory=lambda: _env("AMC_TENANT_INTERFACES", "drive"))
+
+    def interface_list(self) -> tuple[str, ...]:
+        from .tenants import interface_suffixes
+
+        return interface_suffixes(self.tenant_interfaces)
+
     # ── The first administrator (§6.3) ─────────────────────────────────────
     # The first system_owner comes from provisioning, the way a tenant's first
     # administrator does in tenant.yml. Empty means "no owner yet", which

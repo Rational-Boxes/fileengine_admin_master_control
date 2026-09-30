@@ -85,6 +85,11 @@ async function signOut() {
      them. `awaiting_dns` is not a failure. */
   --warning: #fbbf24;
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  /* The sticky bar's height, in ONE place. Both the bar and the sticky table headers
+     that park beneath it read this, so the two cannot drift — a literal 56px in the
+     second place is a magic number that silently becomes wrong the moment the first
+     changes. */
+  --bar-h: 56px;
 }
 
 :root[data-theme='light'] {
@@ -220,6 +225,18 @@ table {
   font-size: 0.9rem;
 }
 th {
+  /* Parked directly under the bar, not over it. Column labels are useless once they
+     have scrolled away from a 218-row table.
+
+     CAVEAT, stated because it is visible rather than hypothetical: at narrow widths
+     the bar wraps to two rows and becomes taller than --bar-h, so the headers tuck
+     slightly beneath it. The alternative is measuring the bar at runtime and writing
+     the value back as a custom property, which is a resize observer and a layout
+     write for a cosmetic overlap on a console used at desk width. */
+  position: sticky;
+  top: var(--bar-h);
+  z-index: 5;
+  background: var(--card);
   text-align: left;
   color: var(--muted);
   font-weight: 500;
@@ -310,10 +327,23 @@ tr:last-child td {
   align-items: center;
   gap: 1.5rem;
   padding: 0 1.5rem;
-  height: 56px;
+  min-height: var(--bar-h);
   border-bottom: 1px solid var(--border);
   background: var(--card);
   flex-wrap: wrap;
+  /* Sticky, because the tables here are long — 218 tenants, an incident ledger —
+     and the nav is how you leave the page you are scrolled into.
+
+     `position: sticky` rather than `fixed`: it keeps the bar in the layout flow, so
+     the content below needs no compensating top margin that would then be wrong at
+     the width where the bar wraps to two lines. `min-height` instead of `height` for
+     the same reason — a fixed height clips the wrapped row.
+
+     The z-index is above the content and deliberately low: nothing here teleports to
+     <body>, so it only has to beat ordinary stacking. */
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 .brand {
   display: flex;

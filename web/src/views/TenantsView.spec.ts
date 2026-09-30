@@ -24,7 +24,7 @@ import { tenants, type TenantView } from '@/services/api'
 import { SYSTEM_OBSERVER, SYSTEM_TENANTS, useSession } from '@/stores/session'
 
 function row(over: Partial<TenantView> = {}): TenantView {
-  return {
+  const base: TenantView = {
     tenant_id: 'acme',
     display_name: 'Acme Corporation',
     has_display_name: true,
@@ -33,6 +33,8 @@ function row(over: Partial<TenantView> = {}): TenantView {
     admits_logins: false,
     gate_cleared: true,
     requested_here: true,
+    base_tenant_id: 'acme',
+    reachable_by_hostname: true,
     created_at: '',
     state_since: '',
     state_by: '',
@@ -44,8 +46,25 @@ function row(over: Partial<TenantView> = {}): TenantView {
     hostnames: ['acme.example.com', 'acme-drive.example.com'],
     records: [],
     may_provision: true,
-    ...over,
   }
+  // base_tenant_id follows the id unless a test says otherwise, so a row is
+  // internally consistent without every caller restating it.
+  const merged = { ...base, ...over }
+  // Derived from the id unless a test says otherwise, so a fixture row is internally
+  // CONSISTENT. Left hardcoded, every row claimed `acme`'s hostnames whatever its id,
+  // which made the rendered output say one thing and the row mean another — a fixture
+  // that lies quietly is worse than one that fails.
+  if (over.tenant_id) {
+    if (over.base_tenant_id === undefined) merged.base_tenant_id = over.tenant_id.split('-')[0]
+    if (over.reachable_by_hostname === undefined) {
+      merged.reachable_by_hostname = !over.tenant_id.includes('-')
+    }
+    if (over.hostnames === undefined) {
+      merged.hostnames = [`${over.tenant_id}.example.com`,
+                          `${over.tenant_id}-drive.example.com`]
+    }
+  }
+  return merged
 }
 
 const stubs = { RouterLink: { template: '<a><slot /></a>' } }
@@ -194,5 +213,211 @@ describe('tenants that predate this console', () => {
     // But it CAN be given a human-readable name, which is the main reason to reach
     // for this page on an established estate.
     expect(w.findAll('button').some((b) => b.text() === 'Name')).toBe(true)
+  })
+})
+
+
+describe('interface hostnames are folded under their tenant', () => {
+  it('does not list <tenant>-drive as a tenant of its own', async () => {
+    // It is the WebDAV HOSTNAME of the tenant above it. The core registered it as a
+    // tenant because it registers anything it is asked about, and the doors resolve
+    // its host to the parent — so no request can ever arrive for it.
+    const w = await view([
+      row({ tenant_id: 'filenginetest', display_name: 'filenginetest', state: 'live',
+            admits_logins: true, may_provision: false }),
+      row({ tenant_id: 'filenginetest-drive', display_name: 'filenginetest-drive',
+            state: 'live', admits_logins: true, may_provision: false,
+            shadowed_by: 'filenginetest' }),
+    ])
+    expect(w.text()).toContain('not a tenant')
+    expect(w.text()).toContain('An interface hostname of')
+    // Folded, NOT hidden: it holds a schema and nothing here can remove it.
+    expect(w.text()).toContain('tenant_filenginetestdrive'.slice(0, 6))
+  })
+
+  it('offers it no actions of its own', async () => {
+    const w = await view([
+      row({ tenant_id: 'acme', state: 'live', admits_logins: true, may_provision: false }),
+      row({ tenant_id: 'acme-drive', state: 'live', admits_logins: true,
+            may_provision: false, shadowed_by: 'acme' }),
+    ])
+    // One tenant row -> one Provision-capable row set. The folded row gets no buttons,
+    // because there is nothing correct to do to it from here.
+    expect(w.findAll('button').filter((b) => b.text() === 'Name')).toHaveLength(1)
+  })
+
+  it('leaves an orphan at the top level and says why it is worse', async () => {
+    // `fileenginetest-drive` has no `fileenginetest` to belong to, so its hostname
+    // points at a tenant that does not exist. Folding it would mean inventing a parent.
+    const w = await view([
+      row({ tenant_id: 'fileenginetest-drive', display_name: 'fileenginetest-drive',
+            state: 'live', admits_logins: true, may_provision: false, shadowed_by: '' }),
+    ])
+    expect(w.text()).toContain('no tenant to belong to')
+  })
+
+  it('lists the interfaces of a real tenant as hostnames, not as tenants', async () => {
+    const w = await view([
+      row({ tenant_id: 'acme', state: 'awaiting_dns', may_provision: false,
+            hostnames: ['acme.example.com', 'acme-drive.example.com',
+                        'acme-mcp.example.com'] }),
+    ])
+    expect(w.text()).toContain('3 interfaces')
+    expect(w.text()).toContain('acme-mcp.example.com')
+  })
+})
+
+describe('the search filter', () => {
+  const estate = () => [
+    row({ tenant_id: 'filenginetest', display_name: 'filenginetest', state: 'live',
+          admits_logins: true, may_provision: false }),
+    row({ tenant_id: 'filenginetest-drive', display_name: 'filenginetest-drive',
+          state: 'live', admits_logins: true, may_provision: false,
+          shadowed_by: 'filenginetest' }),
+    row({ tenant_id: 'rationalboxes', display_name: 'Rational Boxes Ltd',
+          has_display_name: true, state: 'live', admits_logins: true,
+          may_provision: false }),
+    row({ tenant_id: 'acct_iso_a_1932011_15', display_name: 'acct_iso_a_1932011_15',
+          state: 'live', admits_logins: true, may_provision: false }),
+  ]
+
+  async function search(term: string) {
+    const w = await view(estate())
+    const box = w.find('input#q')
+    await box.setValue(term)
+    return w
+  }
+
+  it('matches on the tenant id', async () => {
+    const w = await search('rational')
+    expect(w.text()).toContain('Rational Boxes Ltd')
+    expect(w.text()).not.toContain('acct_iso_a')
+  })
+
+  it('matches on the human-readable name too', async () => {
+    // Someone looking for "Rational Boxes Ltd" and someone looking for
+    // "rationalboxes" are looking for the same tenant.
+    const w = await search('Boxes Ltd')
+    expect(w.text()).toContain('rationalboxes')
+  })
+
+  it('is case-insensitive', async () => {
+    expect((await search('RATIONAL')).text()).toContain('Rational Boxes Ltd')
+  })
+
+  it('does not treat the term as a regex', async () => {
+    // A stray '(' would throw if the term were compiled as a pattern.
+    const w = await search('(')
+    expect(w.text()).toContain('Nothing matches')
+  })
+
+  it('matches a dot literally, because a domain contains one', async () => {
+    // My first version of the test above also asserted that '.' matched nothing, on
+    // the theory that a regex '.' matches everything. That was wrong about this code:
+    // the term is a literal substring and '.' genuinely appears in every base domain,
+    // so matching them all is correct.
+    const w = await search('.com')
+    expect(w.text()).toContain('rationalboxes')
+  })
+
+  it('keeps a parent whose INTERFACE row matched', async () => {
+    // Filtering the flat list first would leave the child with nothing to fold under,
+    // and it would then read as a tenant of its own — the exact misreading this view
+    // exists to correct.
+    const w = await search('filenginetest-drive')
+    expect(w.text()).toContain('An interface hostname of')
+    expect(w.text()).toContain('filenginetest')
+  })
+
+  it('shows every interface of a group it keeps', async () => {
+    const w = await search('rationalboxes')
+    expect(w.text()).not.toContain('An interface hostname of')
+  })
+
+  it('says how many of how many, so a stale filter is visible', async () => {
+    // On an estate this size "1–50" and "1–50 of 218" look identical without the
+    // total, and a filter left set is the commonest reason a tenant appears to be
+    // missing — so the filtered count names what it was filtered FROM.
+    const w = await search('rational')
+    expect(w.text()).toContain('1–1 of 1')
+    expect(w.text()).toContain('filtered from 3')
+  })
+
+  it('offers a way out when nothing matches', async () => {
+    const w = await search('zzzznothing')
+    expect(w.text()).toContain('Nothing matches')
+    expect(w.findAll('button').some((b) => b.text().includes('Clear'))).toBe(true)
+  })
+})
+
+
+describe('the pager', () => {
+  const many = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      row({ tenant_id: `t${String(i).padStart(3, '0')}`,
+            display_name: `t${String(i).padStart(3, '0')}`,
+            state: 'live', admits_logins: true, may_provision: false }))
+
+  it('does not appear when everything fits on one page', async () => {
+    const w = await view(many(5))
+    expect(w.find('.pager').exists()).toBe(false)
+  })
+
+  it('splits a long estate and says where you are', async () => {
+    const w = await view(many(120))
+    expect(w.find('.pager').exists()).toBe(true)
+    expect(w.text()).toContain('1–50 of 120')
+    expect(w.text()).toContain('Page 1 of 3')
+    expect(w.text()).toContain('t000')
+    expect(w.text()).not.toContain('t050')
+  })
+
+  it('moves through the pages', async () => {
+    const w = await view(many(120))
+    const next = w.findAll('button').find((b) => b.text() === 'Next')!
+    await next.trigger('click')
+    expect(w.text()).toContain('51–100 of 120')
+    expect(w.text()).toContain('t050')
+    const last = w.findAll('button').find((b) => b.text() === 'Last')!
+    await last.trigger('click')
+    expect(w.text()).toContain('101–120 of 120')
+    expect(w.text()).toContain('t119')
+  })
+
+  it('RESETS TO PAGE ONE when the filter changes', async () => {
+    // The bug this guards: search while on page 3 and you are left on page 3 of a
+    // one-page result — an empty table that reads as "no matches" and is really
+    // "no such page".
+    const w = await view(many(120))
+    await w.findAll('button').find((b) => b.text() === 'Last')!.trigger('click')
+    expect(w.text()).toContain('Page 3 of 3')
+    await w.find('input#q').setValue('t001')
+    expect(w.text()).toContain('t001')
+    expect(w.find('.pager').exists()).toBe(false)
+  })
+
+  it('never splits a tenant from its interface rows', async () => {
+    // A page ending on the parent with its folded child at the top of the next page
+    // would show the child with no parent above it — the exact misreading this view
+    // exists to prevent. Paging counts GROUPS, so it cannot happen.
+    const rowsIn = [
+      ...many(49),
+      row({ tenant_id: 'zparent', display_name: 'zparent', state: 'live',
+            admits_logins: true, may_provision: false }),
+      row({ tenant_id: 'zparent-drive', display_name: 'zparent-drive', state: 'live',
+            admits_logins: true, may_provision: false, shadowed_by: 'zparent' }),
+    ]
+    const w = await view(rowsIn)
+    // 50 groups, all on page one — the interface row does not count towards the page.
+    expect(w.find('.pager').exists()).toBe(false)
+    expect(w.text()).toContain('zparent')
+    expect(w.text()).toContain('An interface hostname of')
+  })
+
+  it('can show everything at once', async () => {
+    const w = await view(many(120))
+    await w.find('select#per').setValue('0')
+    expect(w.text()).toContain('1–120 of 120')
+    expect(w.find('.pager').exists()).toBe(false)
   })
 })
