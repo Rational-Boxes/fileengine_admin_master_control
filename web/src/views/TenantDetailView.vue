@@ -3,10 +3,11 @@
   SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiError } from '@/services/client'
 import { tenants, type TenantView } from '@/services/api'
+import { SYSTEM_TENANTS, useSession } from '@/stores/session'
 
 const route = useRoute()
 const t = ref<TenantView | null>(null)
@@ -14,9 +15,52 @@ const error = ref('')
 const loading = ref(true)
 const copied = ref(false)
 
+// ── suspend / resume (§3.4b, the reversible phase) ─────────────────────────
+//
+// The status IS the control, where it is displayed. Choosing a different value
+// never acts on its own: it opens a panel asking for a reason and, to suspend, the
+// tenant id typed — the realistic mistake is the right operation on the wrong
+// tenant. Only live <-> suspended is offered; the server enforces the same.
+const s = useSession()
+const MOVABLE = ['live', 'suspended']
+const mayChangeState = computed(
+  () => !!t.value && s.has(SYSTEM_TENANTS) && MOVABLE.includes(t.value.state))
+const pending = ref('')
+const reason = ref('')
+const confirmId = ref('')
+const applying = ref(false)
+const changing = computed(() => !!t.value && !!pending.value && pending.value !== t.value.state)
+const suspending = computed(() => pending.value === 'suspended')
+const canApply = computed(() =>
+  changing.value && !applying.value && reason.value.trim().length > 0 &&
+  (!suspending.value || confirmId.value === t.value?.tenant_id))
+
+function resetState() {
+  pending.value = t.value?.state ?? ''
+  reason.value = ''
+  confirmId.value = ''
+}
+
+async function applyState() {
+  if (!t.value || !canApply.value) return
+  applying.value = true
+  error.value = ''
+  try {
+    t.value = await tenants.setState(
+      t.value.tenant_id, pending.value as 'live' | 'suspended', reason.value.trim(),
+      suspending.value ? confirmId.value : '')
+    resetState()
+  } catch (e) {
+    error.value = apiError(e)
+  } finally {
+    applying.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     t.value = await tenants.get(String(route.params.id))
+    resetState()
   } catch (e) {
     error.value = apiError(e)
   } finally {
@@ -67,7 +111,13 @@ function copyZone() {
         <section class="card">
           <h2>Gate</h2>
           <p class="row">
-            <span class="pill">{{ t.state.replace(/_/g, ' ') }}</span>
+            <select v-if="mayChangeState" v-model="pending" aria-label="Tenant status"
+                    class="status-select" :class="t.state === 'suspended' ? 'bad' : 'ok'"
+                    :disabled="applying">
+              <option value="live">live</option>
+              <option value="suspended">suspended</option>
+            </select>
+            <span v-else class="pill">{{ t.state.replace(/_/g, ' ') }}</span>
             <span class="pill" :class="t.admits_logins ? 'ok' : ''">
               logins {{ t.admits_logins ? 'admitted' : 'refused' }}
             </span>
@@ -76,6 +126,37 @@ function copyZone() {
               {{ t.may_provision ? 'may provision' : 'gate closed' }}
             </span>
           </p>
+          <div v-if="changing" class="state-change" :class="{ danger: suspending }">
+            <h3 v-if="suspending">Suspend {{ t.tenant_id }}?</h3>
+            <h3 v-else>Resume {{ t.tenant_id }}?</h3>
+            <p v-if="suspending" class="small">
+              Every door that checks tenant state refuses this tenant within about a
+              minute: sign-in, the web app and its API, and WebDAV. Nothing is
+              destroyed, and resuming restores access exactly as it was.
+              Services that verify session tokens on their own — search, discussions,
+              shares — keep honouring sessions issued before now until those expire.
+            </p>
+            <p v-else class="small">
+              Sign-in and every door admit this tenant again, within seconds.
+            </p>
+            <label for="state-reason">Reason <span class="muted">(recorded on the tenant)</span></label>
+            <textarea id="state-reason" v-model="reason" data-test="state-reason" rows="2"
+                      maxlength="500"
+                      :placeholder="suspending ? 'e.g. unpaid invoice; customer request' : 'e.g. invoice paid'" />
+            <template v-if="suspending">
+              <label for="state-confirm">Type <span class="mono">{{ t.tenant_id }}</span> to confirm</label>
+              <input id="state-confirm" v-model="confirmId" data-test="state-confirm"
+                     autocomplete="off" spellcheck="false" />
+            </template>
+            <div class="row">
+              <button class="btn" :class="{ danger: suspending }" data-test="apply-state"
+                      :disabled="!canApply" @click="applyState">
+                {{ applying ? 'Applying…' : suspending ? 'Suspend tenant' : 'Resume tenant' }}
+              </button>
+              <button class="btn secondary" data-test="cancel-state" :disabled="applying"
+                      @click="resetState">Cancel</button>
+            </div>
+          </div>
           <p v-if="t.state_by" class="muted small">
             moved to {{ t.state.replace(/_/g, ' ') }} by {{ t.state_by }}
             <template v-if="t.state_since"> · {{ t.state_since }}</template>
@@ -144,6 +225,31 @@ function copyZone() {
 </template>
 
 <style scoped>
+/* The status as a control. Coloured like the pill it replaces, so "live" still
+   reads as healthy and "suspended" as refused at a glance. */
+.status-select {
+  font: inherit;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+}
+.status-select.ok { border-color: var(--success); }
+.status-select.bad { border-color: var(--danger); color: var(--danger); }
+.state-change {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+}
+.state-change.danger { border-color: var(--danger); }
+.state-change h3 { margin: 0; }
+.state-change textarea,
+.state-change input { font: inherit; width: 100%; box-sizing: border-box; }
 .grid.two {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   margin-bottom: 1rem;

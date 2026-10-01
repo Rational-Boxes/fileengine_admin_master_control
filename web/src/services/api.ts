@@ -183,6 +183,13 @@ export const tenants = {
       `/v1/tenants/${encodeURIComponent(id)}/display-name`, { display_name })
     return r.data
   },
+  /** Suspend (`suspended`) or resume (`live`). `confirm` is the tenant id typed,
+   *  which the server requires to suspend. */
+  async setState(id: string, state: 'live' | 'suspended', reason: string, confirm = '') {
+    const r = await http.post<TenantView>(
+      `/v1/tenants/${encodeURIComponent(id)}/state`, { state, reason, confirm })
+    return r.data
+  },
   async dnsCheck(id: string) {
     const r = await http.post<TenantView>(`/v1/tenants/${encodeURIComponent(id)}/dns-check`)
     return r.data
