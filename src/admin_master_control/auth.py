@@ -129,6 +129,9 @@ class DeploymentDirectory(Protocol):
 
     def authenticate(self, subject: str, password: str) -> bool: ...
     def roles_of(self, subject: str) -> frozenset[str]: ...
+    # OPTIONAL: `canonical(name) -> uid | None` resolves a sign-in name that may
+    # be a uid OR an email to the one account it names. A directory without it
+    # is treated as uid-only, which is what every directory used to be.
 
 
 @dataclass
@@ -157,6 +160,10 @@ class LdapDeploymentDirectory:
     def role_base(self) -> str:
         return f"{self.role_ou},{self.base_dn}"
 
+    @property
+    def user_base(self) -> str:
+        return f"{self.user_ou},{self.base_dn}"
+
     def user_dn(self, subject: str) -> str:
         return f"uid={subject},{self.user_ou},{self.base_dn}"
 
@@ -167,11 +174,81 @@ class LdapDeploymentDirectory:
         return ldap3.Connection(server, user=dn, password=password,
                                 auto_bind=True, raise_exceptions=False)
 
+    def _resolve(self, name: str) -> Optional[tuple[str, str]]:
+        """``(uid, dn)`` of the ONE account whose uid or mail is ``name``.
+
+        None when no account answers to it, and ALSO when more than one does:
+        two accounts behind one sign-in name is a directory defect, and picking
+        either would be guessing which person is signing in.
+
+        Raises DirectoryUnavailable when the user OU cannot be searched — "the
+        directory could not be asked" must never read as "no such account".
+
+        The DN used afterwards is the one the directory RETURNED, never one built
+        from what was typed, and the value is filter-escaped: this is the one
+        point where unauthenticated input reaches an LDAP filter.
+        """
+        import ldap3
+        from ldap3.utils.conv import escape_filter_chars
+
+        if not name:
+            return None
+        try:
+            conn = self._connect(self.bind_dn, self.bind_password)
+        except Exception as e:  # noqa: BLE001
+            log.warning("directory unreachable resolving sign-in name: %s", e)
+            raise DirectoryUnavailable(
+                f"the deployment directory could not be reached: {e}") from e
+        try:
+            v = escape_filter_chars(name)
+            conn.search(self.user_base,
+                        f"(&(objectClass=inetOrgPerson)(|(uid={v})(mail={v})))",
+                        search_scope=ldap3.SUBTREE, attributes=["uid"])
+            # NOT the boolean: ldap3 returns False for "no entries" even when the
+            # search succeeded. The result code is what separates "nobody by that
+            # name" from "could not look".
+            result = getattr(conn, "result", None) or {}
+            if result.get("result", 0) != 0:
+                desc = result.get("description") or result.get("result")
+                log.error("user search under %s failed (%s) — bound as %r",
+                          self.user_base, desc, self.bind_dn or "<anonymous>")
+                raise DirectoryUnavailable(
+                    f"the account OU {self.user_base} could not be searched ({desc})")
+            entries = list(conn.entries)
+            if len(entries) != 1:
+                if len(entries) > 1:
+                    log.error("sign-in name matches %d accounts; refusing rather than "
+                              "choosing one", len(entries))
+                return None
+            e = entries[0]
+            uid = e.uid.value if e.uid is not None else None
+            if isinstance(uid, (list, tuple)):
+                uid = uid[0] if uid else None
+            if not uid:
+                return None
+            return str(uid), str(e.entry_dn)
+        finally:
+            try:
+                conn.unbind()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def canonical(self, name: str) -> Optional[str]:
+        r = self._resolve(name)
+        return r[0] if r else None
+
+    def _dn_of(self, subject: str) -> Optional[str]:
+        r = self._resolve(subject)
+        return r[1] if r else None
+
     def authenticate(self, subject: str, password: str) -> bool:
         if not subject or not password:
             return False
+        dn = self._dn_of(subject)
+        if dn is None:
+            return False
         try:
-            conn = self._connect(self.user_dn(subject), password)
+            conn = self._connect(dn, password)
         except Exception as e:  # noqa: BLE001 - an unreachable directory is a refusal
             log.warning("directory bind failed for %s: %s", subject, e)
             return False
@@ -186,7 +263,12 @@ class LdapDeploymentDirectory:
     def roles_of(self, subject: str) -> frozenset[str]:
         import ldap3
 
-        dn = self.user_dn(subject)
+        # The DN the directory holds for this account, so the member match is
+        # exact whether the subject arrived as a uid or an email. An account the
+        # directory does not hold has no roles here.
+        dn = self._dn_of(subject)
+        if dn is None:
+            return frozenset()
         try:
             conn = self._connect(self.bind_dn, self.bind_password)
         except Exception as e:  # noqa: BLE001
@@ -199,10 +281,15 @@ class LdapDeploymentDirectory:
                 f"the deployment directory could not be reached: {e}") from e
         try:
             # SUBTREE of the deployment OU ONLY. Never base_dn, never a tenant OU.
-            ok = conn.search(self.role_base,
-                             f"(&(objectClass=groupOfNames)(member={dn}))",
-                             search_scope=ldap3.SUBTREE, attributes=["cn"])
-            if not ok:
+            from ldap3.utils.conv import escape_filter_chars
+            conn.search(self.role_base,
+                        f"(&(objectClass=groupOfNames)(member={escape_filter_chars(dn)}))",
+                        search_scope=ldap3.SUBTREE, attributes=["cn"])
+            # The RESULT CODE, not search()'s boolean: ldap3 returns False for
+            # "no entries" even on success, which made an account holding no
+            # deployment role look like an unreadable OU (503, "come back later")
+            # instead of what it is (403, "you hold no authority here").
+            if (getattr(conn, "result", None) or {}).get("result", 0) != 0:
                 # The search itself failed — the commonest cause is exactly the one
                 # that bit here: an ANONYMOUS or under-privileged bind against a
                 # directory that hides the role OU. OpenLDAP answers `noSuchObject`
@@ -245,6 +332,16 @@ class StaticDeploymentDirectory:
 
     passwords: dict[str, str] = field(default_factory=dict)
     grants: dict[str, set[str]] = field(default_factory=dict)
+    #: email -> uid, for accounts whose uid is not their address.
+    emails: dict[str, str] = field(default_factory=dict)
+
+    def canonical(self, name: str) -> Optional[str]:
+        if not name:
+            return None
+        if name in self.passwords or name in self.grants:
+            return name
+        by_mail = {k.lower(): v for k, v in self.emails.items()}
+        return by_mail.get(name.lower())
 
     def authenticate(self, subject: str, password: str) -> bool:
         return bool(password) and self.passwords.get(subject) == password
@@ -411,6 +508,17 @@ def login(config: Config, directory: DeploymentDirectory, subject: str, password
     empty session. There is nothing at this tier for a principal with no role to
     do, and an empty session is a thing that exists and can be passed around.
     """
+    # A uid OR an email may be typed; from here on there is ONE name for the
+    # account — its uid — so the ledger, the role search, the 2FA store (keyed by
+    # uid) and the token's subject all agree however it was typed. An unknown
+    # name is "bad credentials", exactly like a wrong password, so this is not an
+    # oracle for which addresses have accounts.
+    resolve = getattr(directory, "canonical", None)
+    if resolve is not None:
+        canonical = resolve(subject)
+        if canonical is None:
+            raise AuthError("bad credentials")
+        subject = canonical
     if not directory.authenticate(subject, password):
         raise AuthError("bad credentials")
     roles = directory.roles_of(subject)
