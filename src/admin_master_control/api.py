@@ -34,20 +34,54 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .administrators import AdministratorRegistry, summarise
 from .auth import (
+    CHALLENGE_ENROLL,
+    CHALLENGE_VERIFY,
     AuthError,
     DeploymentDirectory,
     Principal,
     login as do_login,
     make_require,
+    mint_challenge,
     mint_token,
     reconcile,
+    verify_challenge,
 )
 from .config import Config
+from .mfa import (
+    ADMITTED,
+    ENROLLMENT_REQUIRED,
+    VERIFY_REQUIRED,
+    FactorStore,
+    MfaGate,
+)
 from .redactions import ErasureSource, register as redaction_register
+from .job_store import InMemoryJobStore, JobStore, StoreUnavailable
+from .registry import (
+    CLAIMABLE,
+    LIVE,
+    PROVISIONING,
+    RegistryRefused,
+    RegistryUnavailable,
+    StaticTenantRegistry,
+    TenantRegistry,
+    schema_name_for,
+)
+from .tls import SystemTlsProbe, TlsProbe, check_tls
+from .tenants import (
+    Resolver,
+    StaticResolver,
+    TenantError,
+    check_dns,
+    hostnames_for,
+    provisioning_job,
+    records_for,
+    validate_tenant_id,
+)
 from .incidents import (
     IncidentSource,
     LedgerUnavailable,
@@ -61,6 +95,7 @@ from .roles import (
     SYSTEM_OBSERVER,
     SYSTEM_OWNER,
     SYSTEM_SECURITY,
+    SYSTEM_TENANTS,
     RoleError,
 )
 
@@ -70,7 +105,42 @@ log = logging.getLogger("admin_master_control.api")
 class LoginRequest(BaseModel):
     subject: str
     password: str
-    second_factor: Optional[str] = None
+    # NO `second_factor`. It was a self-asserted string: checked against a set of
+    # factor NAMES and folded into the signed amr without a code being verified,
+    # so {"second_factor":"totp"} bought a fully MFA-marked token. Removed rather
+    # than deprecated — a field that still parses is a hole still reachable.
+
+
+class ChallengeBody(BaseModel):
+    """The pre-session token from /auth/token, plus a code where one is due."""
+
+    challenge_token: str
+
+
+class VerifyBody(ChallengeBody):
+    code: str
+    method: str = "totp"
+
+
+class EnrollCompleteBody(ChallengeBody):
+    code: str
+
+
+class TenantRequestBody(BaseModel):
+    tenant_id: str
+    base_domain: str
+    address: str
+    initial_admin: str
+    #: The name a human uses. Optional, free text, and NEVER an identifier.
+    display_name: str = ""
+
+
+class DisplayNameBody(BaseModel):
+    display_name: str
+
+
+class OverrideBody(BaseModel):
+    reason: str
 
 
 class GrantRequest(BaseModel):
@@ -98,42 +168,189 @@ class TransitionRequest(BaseModel):
 def build_router(config: Config, registry: AdministratorRegistry,
                  directory: DeploymentDirectory,
                  incidents: IncidentSource | None = None,
-                 erasures: ErasureSource | None = None) -> APIRouter:
+                 erasures: ErasureSource | None = None,
+                 resolver: Resolver | None = None,
+                 # NOT `registry`: that is the AdministratorRegistry above. Two
+                 # different registries in one signature is exactly the sort of
+                 # near-name that reads fine and binds the wrong object.
+                 tenant_registry: TenantRegistry | None = None,
+                 jobs: JobStore | None = None,
+                 tls_probe: TlsProbe | None = None,
+                 factors: FactorStore | None = None) -> APIRouter:
     r = APIRouter(prefix="/v1")
     require = make_require(config)
+    gate = MfaGate(config, factors)
+
+    def _challenge(token: str, expect: str) -> Principal:
+        """Verify a challenge for one specific purpose, or 401.
+
+        `expect` is not optional. An enrollment challenge must not complete a
+        verification, nor the reverse — otherwise someone already enrolled could
+        take the enrollment path after a password-only login and overwrite their
+        factor with one they chose.
+        """
+        try:
+            return verify_challenge(config, token, expect)
+        except AuthError as e:
+            log.info("challenge refused: %s", e.reason)
+            raise HTTPException(status_code=e.status_code, detail=e.reason) from e
+
+    def _session(principal: Principal, amr: tuple[str, ...]) -> dict:
+        """The real session, and the ONLY place one is minted after a factor."""
+        proven = Principal(subject=principal.subject, roles=principal.roles, amr=amr)
+        return {
+            "token": mint_token(config, proven),
+            "subject": proven.subject,
+            "roles": sorted(proven.roles),
+            "amr": list(proven.amr),
+            "can_grant": SYSTEM_OWNER in proven.roles,
+        }
 
     # ── the door ───────────────────────────────────────────────────────────
 
     @r.post("/auth/token")
     def issue_token(body: LoginRequest):
-        """Authenticate and mint a session for this tier.
+        """Step one: the password. NOT, by itself, a session.
 
-        The audience is distinct, so what comes back is useless at every tenant
-        door — and a tenant token is useless here, which is the half that
-        matters.
+        The audience is distinct, so what eventually comes back is useless at
+        every tenant door — and a tenant token is useless here, which is the half
+        that matters.
+
+        While a second factor is required this returns a CHALLENGE, not a token:
+        either `verify` for an administrator who has a factor, or `enroll` for one
+        who does not. There is no third branch in which a correct password alone
+        yields a session, which is what `AMC_REQUIRE_MFA=true` now actually means.
         """
         try:
-            principal = do_login(config, directory, body.subject, body.password,
-                                 second_factor=body.second_factor)
+            principal = do_login(config, directory, body.subject, body.password)
         except AuthError as e:
             log.info("login refused for %s: %s", body.subject, e.reason)
             raise HTTPException(status_code=e.status_code, detail="unauthorized") from e
 
-        if config.require_mfa and not principal.has_second_factor:
-            # Refuse to MINT a session that the gate would then refuse on every
-            # request. Issuing one would be a login that "succeeds" and then
-            # 403s everything, which reads as a broken service rather than as a
-            # missing second factor.
-            log.info("login refused for %s: second factor required", body.subject)
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail="second factor required")
+        try:
+            step = gate.next_step(principal.subject)
+        except AuthError as e:
+            # Required-but-unenforceable, or an unreachable store. FAILS CLOSED,
+            # and says which, because "your code was wrong" would send an
+            # administrator to re-scan a QR that is fine.
+            log.error("login refused for %s: %s", body.subject, e.reason)
+            raise HTTPException(status_code=e.status_code, detail=e.reason) from e
 
-        return {
-            "token": mint_token(config, principal),
-            "subject": principal.subject,
-            "roles": sorted(principal.roles),
-            "amr": list(principal.amr),
-        }
+        if step == ENROLLMENT_REQUIRED:
+            # First login with no factor. §6 requires one, so they get an
+            # enrollment-only challenge and nothing else — not a session with a
+            # reminder attached. 401, because they are not yet authenticated: the
+            # password is one of two things they owe.
+            log.info("%s must enrol a second factor before a session is issued",
+                     principal.subject)
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"status": ENROLLMENT_REQUIRED,
+                         "challenge_token": mint_challenge(config, principal,
+                                                           CHALLENGE_ENROLL),
+                         "methods": list(gate.methods()),
+                         "expires_in": config.mfa_challenge_ttl_s,
+                         "detail": "a second factor is required at this tier; "
+                                   "enrol one to continue"})
+
+        if step == VERIFY_REQUIRED:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"status": VERIFY_REQUIRED,
+                         "challenge_token": mint_challenge(config, principal,
+                                                           CHALLENGE_VERIFY),
+                         "methods": list(gate.methods()),
+                         "expires_in": config.mfa_challenge_ttl_s,
+                         "detail": "second factor required"})
+
+        # ADMITTED — the explicit opt-out (AMC_REQUIRE_MFA=false). Logged by the
+        # gate on every use, and reported by /readyz, because a deployment should
+        # not be able to run this way quietly.
+        assert step == ADMITTED
+
+        return _session(principal, ("pwd",))
+
+    # ── the second factor: enrol, then prove (§6) ──────────────────────────
+    #
+    # These three are the ONLY routes reachable with a challenge token, and they
+    # are reachable with nothing else. The separation is structural rather than
+    # conditional: a challenge carries a different `aud`, PyJWT is given the
+    # audience to validate, so a challenge presented to any other route fails
+    # signature-and-claim validation together. There is no branch anywhere that
+    # accepts a challenge as a session.
+
+    @r.post("/auth/mfa/enroll/begin")
+    def enroll_begin(body: ChallengeBody):
+        """Start enrollment for an administrator who has no factor.
+
+        The secret is returned ONCE, to the holder of a challenge proving they
+        just supplied the right password. Nothing is enabled yet: `enroll-begin`
+        stores a PENDING secret, and a pending enrollment is not a factor — which
+        is why `next_step` reads `enabled` rather than `pending` and an
+        abandoned enrollment leaves the account still owing one.
+        """
+        principal = _challenge(body.challenge_token, CHALLENGE_ENROLL)
+        try:
+            begun = gate.enroll_begin(principal.subject)
+        except AuthError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason) from e
+        log.info("second-factor enrolment begun for %s", principal.subject)
+        # The challenge is returned so the client can complete without re-posting
+        # the password. Same token, same short expiry — not a fresh one, or the
+        # window would extend for as long as someone kept calling begin.
+        return {"status": "enrolment_started",
+                "otpauth_uri": begun.get("otpauth_uri", ""),
+                "secret": begun.get("secret", ""),
+                "issuer": begun.get("issuer", ""),
+                "account": begun.get("account", principal.subject),
+                "challenge_token": body.challenge_token}
+
+    @r.post("/auth/mfa/enroll/complete")
+    def enroll_complete(body: EnrollCompleteBody):
+        """Confirm enrollment with a generated code, and only then issue a session.
+
+        The recovery codes are returned HERE and nowhere else, once. They matter
+        more at this tier than anywhere: losing the only factor on the console
+        that grants all authority is the stranded state /readyz reports, and no
+        other administrator can necessarily fix it.
+        """
+        principal = _challenge(body.challenge_token, CHALLENGE_ENROLL)
+        try:
+            done = gate.enroll_complete(principal.subject, body.code)
+        except AuthError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason) from e
+        if not done.get("ok"):
+            # Not a session, and not a new challenge either: the one they hold is
+            # still valid until it expires.
+            log.info("second-factor enrolment failed for %s: wrong code", principal.subject)
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="that code did not match; try the next one")
+        log.info("second-factor enrolment completed for %s", principal.subject)
+        out = _session(principal, ("pwd", "totp"))
+        out["recovery_codes"] = list(done.get("recovery_codes") or [])
+        out["status"] = "enrolled"
+        return out
+
+    @r.post("/auth/mfa/verify")
+    def mfa_verify(body: VerifyBody):
+        """Prove an existing factor, and get the session.
+
+        The method is checked against this tier's allowlist rather than the
+        tenant-wide cap, so `email` cannot be reached by naming it — see
+        Config.mfa_methods for why it is excluded here and not elsewhere.
+        """
+        principal = _challenge(body.challenge_token, CHALLENGE_VERIFY)
+        try:
+            ok = gate.verify(principal.subject, body.method, body.code)
+        except AuthError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason) from e
+        if not ok:
+            log.info("second factor refused for %s (%s)", principal.subject, body.method)
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="that code did not match")
+        method = body.method.strip().lower()
+        log.info("second factor accepted for %s (%s)", principal.subject, method)
+        return _session(principal, ("pwd", method))
 
     @r.get("/whoami")
     def whoami(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
@@ -402,5 +619,389 @@ def build_router(config: Config, registry: AdministratorRegistry,
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                     detail="queue state unavailable") from e
         return redaction_register(erasures, states)
+
+    # ── tenant setup and management (§3.4a) ────────────────────────────────
+    #
+    # THIS APPLICATION NEVER TOUCHES DNS AND NEVER RUNS ANSIBLE. DNS is managed
+    # wherever the domain is, by a human — so there is no DNS credential here
+    # because there is no DNS operation. And the playbook is executed by a runner
+    # on the host that holds the vault password; these routes write a JOB (§5.3).
+
+    _registry: TenantRegistry = (tenant_registry if tenant_registry is not None
+                                 else StaticTenantRegistry())
+    _jobs: JobStore = jobs if jobs is not None else InMemoryJobStore()
+    _resolver: Resolver = resolver if resolver is not None else StaticResolver(answers={})
+
+    _interfaces = config.interface_list()
+    _tls: TlsProbe = tls_probe if tls_probe is not None else SystemTlsProbe()
+
+    def _hostnames_of(t) -> list:
+        """Every subdomain this tenant is served on, or none when unknown.
+
+        A tenant that predates this console has no recorded base domain, and one with a
+        hyphenated id is not reachable as itself — deriving hostnames for either would be
+        inventing names to then report as broken.
+        """
+        if not t.base_domain or not t.reachable_by_hostname:
+            return []
+        return hostnames_for(t.tenant_id, t.base_domain, _interfaces)
+
+    def _run_dns(t):
+        verdict = check_dns(t.tenant_id, t.base_domain, t.address, _resolver, _interfaces)
+        return {"ok": verdict.ok, "authoritative": verdict.authoritative,
+                "blocking_reason": verdict.blocking_reason,
+                "checks": [{"hostname": c.hostname, "ok": c.ok,
+                            "resolved": list(c.resolved), "expected": c.expected,
+                            "detail": c.detail} for c in verdict.checks]}
+
+    def _needs_hostnames(t):
+        """Refuse a check there is nothing to check, and say which it is."""
+        if not t.base_domain or not t.address:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{t.tenant_id} has no recorded base domain or address — it was "
+                       f"not requested through this console, so there is nothing to "
+                       f"check its DNS or certificates against.")
+        if not t.reachable_by_hostname:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{t.tenant_id} is an interface hostname of "
+                       f"{t.base_tenant_id}, not a tenant — the doors resolve its host "
+                       f"to {t.base_tenant_id}, so it has no subdomains of its own to "
+                       f"check.")
+
+    def _records_of(t) -> list:
+        """The zone lines, derived rather than stored.
+
+        A tenant that predates this console has no base domain recorded, so there is
+        nothing to derive — an empty list, not a guess.
+        """
+        if not t.base_domain or not t.address:
+            return []
+        return [{"name": rec.name, "type": rec.type, "value": rec.value,
+                 "zone_line": rec.as_zone_line()}
+                for rec in records_for(t.tenant_id, t.base_domain, t.address, _interfaces)]
+
+    def _with_records(t) -> dict:
+        out = t.for_display()
+        out["hostnames"] = _hostnames_of(t)
+        out["records"] = _records_of(t)
+        return out
+
+    def _must_get(tenant_id: str):
+        try:
+            t = _registry.get(tenant_id)
+        except RegistryUnavailable as e:
+            # 503, not 404. "No such tenant" and "could not ask" need different
+            # responses, and reporting the first sends someone looking for a tenant
+            # that is fine.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        if t is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        return t
+
+    @r.post("/tenants", status_code=status.HTTP_201_CREATED)
+    def request_tenant(body: TenantRequestBody,
+                       principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Request a tenant, and return exactly the DNS records to create.
+
+        Writes a row to the REGISTRY in state `requested` — the same table the doors
+        read and provisioning updates. There is no separate request table: the
+        registry already models `requested → awaiting_dns → provisioning → live`, so
+        a second one would be the same facts twice with two writers.
+        """
+        principal.authorising(SYSTEM_TENANTS)
+        try:
+            tenant_id = validate_tenant_id(body.tenant_id)
+            if not body.base_domain:
+                raise TenantError("a base domain is required")
+            if not body.address:
+                raise TenantError("the address the hostnames must point at is required")
+            if not body.initial_admin:
+                # A tenant with no administrator is a tenant nobody can manage, and
+                # the platform's own tenant.yml takes one for the same reason.
+                raise TenantError("a first administrator is required")
+        except TenantError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        try:
+            # No prior existence check: a SELECT then an INSERT is two statements and
+            # a race, and only the registry's unique index is authoritative.
+            t = _registry.request(tenant_id=tenant_id, base_domain=body.base_domain,
+                                  address=body.address, initial_admin=body.initial_admin,
+                                  requested_by=principal.subject,
+                                  display_name=body.display_name.strip())
+        except RegistryRefused as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s requested by %s", tenant_id, principal.subject)
+        return _with_records(t)
+
+    @r.get("/tenants")
+    def list_tenants(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """EVERY tenant in the registry, not only the ones requested here.
+
+        Built from the registry outward. Building it from this console's own request
+        rows outward is what made this page show nothing on a deployment with seventy
+        live tenants — they predate the console, so they have no request of ours, and
+        that is the normal case rather than a gap.
+        """
+        try:
+            rows = _registry.list()
+        except RegistryUnavailable as e:
+            # NOT an empty list, which would report an estate with no tenants.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+
+        # Which ids actually exist, so an unreachable row can say whether its
+        # hostname goes to a real tenant or to nothing at all. The two cases need
+        # different responses: `filenginetest-drive` is shadowed by a live tenant and
+        # is harmless clutter, while `fileenginetest-drive` — a typo nobody owns —
+        # points its traffic at a tenant that does not exist.
+        present = {t.tenant_id for t in rows}
+        out = []
+        for t in rows:
+            shown = _with_records(t)
+            if not t.reachable_by_hostname:
+                shown["shadowed_by"] = t.base_tenant_id if t.base_tenant_id in present else ""
+            out.append(shown)
+        try:
+            return {"tenants": out}
+        except RegistryUnavailable as e:
+            # NOT an empty list, which would report an estate with no tenants.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+
+    @r.get("/tenants/{tenant_id}")
+    def get_tenant(tenant_id: str,
+                   principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        return _with_records(_must_get(tenant_id))
+
+    @r.put("/tenants/{tenant_id}/display-name")
+    def set_display_name(tenant_id: str, body: DisplayNameBody,
+                         principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Set the human-readable name, for billing and high-level operations.
+
+        This renames the LABEL and never the identifier. `tenant_id` reaches a
+        hostname, a Postgres schema, an LDAP DN and a file path, so it is immutable;
+        an organisation renaming itself must not move its data. Allowed in any
+        lifecycle state, including decommissioned, so a billing history stays readable.
+        """
+        principal.authorising(SYSTEM_TENANTS)
+        _must_get(tenant_id)
+        name = body.display_name.strip()
+        if len(name) > 200:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="that name is too long (200 characters)")
+        try:
+            t = _registry.set_display_name(tenant_id, name)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s display name set by %s", tenant_id, principal.subject)
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/dns-check")
+    def check(tenant_id: str,
+              principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Run the DNS gate — every subdomain, primary and service alike.
+
+        Asks the zone's authoritative nameservers, compares the ADDRESS rather than
+        merely that something resolves, and checks EVERY hostname. Each of those is a way
+        a green tick can be wrong, and a wrong green tick here burns certificate issuance
+        for the whole domain.
+
+        DNS only, and fast: this is the input to the provisioning gate, and it is the one
+        that gets pressed repeatedly while waiting for propagation. `verify` below does
+        this and the certificates together.
+        """
+        t = _must_get(tenant_id)
+        _needs_hostnames(t)
+        dns = _run_dns(t)
+        try:
+            t = _registry.record_dns(tenant_id, dns)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s DNS check: %s", tenant_id,
+                 "passed" if dns["ok"] else dns["blocking_reason"])
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/verify")
+    def verify(tenant_id: str,
+               principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """Is this tenant actually live? DNS **and** TLS, on every subdomain.
+
+        The two halves answer different questions and a tenant needs both to work:
+
+          * DNS — does each name resolve, authoritatively, to the right address.
+          * TLS — is each name serving a trusted certificate that covers it, and for
+            how much longer.
+
+        Every subdomain separately, because every one has its own record and its own
+        certificate. A tenant whose primary host is fine and whose `-drive` host expired
+        is one whose WebDAV stopped while its web interface kept serving, and a single
+        verdict cannot say that.
+
+        Gated on the OBSERVER baseline, not system_tenants: this is a read. It resolves
+        names and opens TLS connections and changes nothing about the tenant — and
+        noticing that a certificate expires in nine days should not require the authority
+        to provision.
+
+        THE CERTIFICATE RESULT DOES NOT FEED THE PROVISIONING GATE. No certificate exists
+        before provisioning, so requiring one would make the gate unpassable; `absent` is
+        the expected answer for a tenant being created and is not reported as a fault.
+        """
+        t = _must_get(tenant_id)
+        _needs_hostnames(t)
+        hosts = _hostnames_of(t)
+
+        dns = _run_dns(t)
+        tls = check_tls(hosts, _tls).as_dict()
+        try:
+            _registry.record_dns(tenant_id, dns)
+            t = _registry.record_tls(tenant_id, tls)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.info("tenant %s verify: dns=%s tls=%s", tenant_id,
+                 "ok" if dns["ok"] else "not ready",
+                 "ok" if tls["ok"] else (tls["blocking_reason"] or "not ready"))
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/dns-override")
+    def do_override(tenant_id: str, body: OverrideBody,
+                    principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Force past the DNS gate, recorded.
+
+        There are legitimate reasons the check fails on a correct setup —
+        split-horizon DNS, a CDN in front, a zone the administrator does not control
+        but has been told is ready. This is the one path to provisioning that can
+        exhaust certificate issuance for every tenant on the domain, which is why it
+        takes a reason and keeps a name attached rather than being a retry button.
+        """
+        authorised_as = principal.authorising(SYSTEM_TENANTS)
+        t = _must_get(tenant_id)
+        reason = body.reason.strip()
+        if not reason:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="an override needs a reason: it is the one path to provisioning "
+                       "that can exhaust certificate issuance for the whole deployment")
+        if t.state not in CLAIMABLE:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{tenant_id} is {t.state} — the DNS gate only applies before "
+                       f"provisioning")
+        try:
+            t = _registry.record_override(tenant_id, principal.subject, reason)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        log.warning("tenant %s DNS gate overridden by %s (as %s): %s",
+                    tenant_id, principal.subject, authorised_as, reason)
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/provision", status_code=status.HTTP_202_ACCEPTED)
+    def provision(tenant_id: str,
+                  principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Claim the request and write the job for the runner.
+
+        202, not 200: this application has ASKED. A playbook is minutes and an HTTP
+        request is not, so the work is a job with state, and the runner — which holds
+        the credentials this application deliberately does not — claims it.
+        """
+        authorised_as = principal.authorising(SYSTEM_TENANTS)
+        before = _must_get(tenant_id)          # 404 before anything else
+
+        # CLAIM FIRST, in the REGISTRY. One conditional UPDATE moves a gated request
+        # to `provisioning`, so two administrators pressing this at the same moment
+        # cannot both queue a run — and two runs mean two certificate issuance
+        # attempts against a rate limit SHARED BY EVERY TENANT on the domain. The
+        # gate is held by the database rather than by arrival order.
+        try:
+            claimed = _registry.claim_for_provisioning(tenant_id, principal.subject)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        if claimed is None:
+            # WHICH refusal matters. An earlier version let the job builder produce
+            # this message, which told the second presser "the DNS gate has not
+            # passed" about a tenant whose gate HAD passed and whose run was already
+            # underway — sending them to re-check DNS that was fine.
+            now = _must_get(tenant_id)
+            if now.state == PROVISIONING:
+                # The race, or a double click. Distinguished from "in service"
+                # because they are different situations: a tenant live since June
+                # being told "another administrator started it a moment ago" is
+                # simply false, and reads as a race that did not happen.
+                detail = (f"tenant {tenant_id} is already being provisioned — another "
+                          f"administrator started it a moment ago. No second run has "
+                          f"been queued.")
+            elif now.state not in CLAIMABLE:
+                detail = (f"tenant {tenant_id} is {now.state} and cannot be "
+                          f"provisioned again. Provisioning applies to a tenant being "
+                          f"created, not one already in service.")
+            else:
+                detail = (f"tenant {tenant_id} is {now.state} and the DNS gate has not "
+                          f"passed and has not been overridden. Provisioning now would "
+                          f"fail at the certificate step and consume the domain's rate "
+                          f"limit, which is shared by every tenant.")
+            # 409, not 400: the request is well-formed, the SEQUENCE is wrong.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+        job = provisioning_job(
+            tenant_id=claimed.tenant_id, base_domain=claimed.base_domain,
+            address=claimed.address, initial_admin=claimed.initial_admin,
+            hostnames=hostnames_for(claimed.tenant_id, claimed.base_domain, _interfaces)
+            if claimed.base_domain else [],
+            requested_by=principal.subject,
+            dns_verified=bool((before.dns or {}).get("ok")),
+            override_by=claimed.override_by, override_reason=claimed.override_reason)
+        job["authorised_as"] = authorised_as
+        try:
+            job["job_id"] = _jobs.record(tenant_id, job)
+            _registry.attach_job(tenant_id, job["job_id"])
+        except (StoreUnavailable, RegistryUnavailable) as e:
+            # The claim already moved the registry to `provisioning`. Say so rather
+            # than implying nothing happened: the tenant is not reachable in that
+            # state, and an operator needs to know it needs picking up by hand.
+            log.error("tenant %s was claimed but its job could not be written: %s",
+                      tenant_id, e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"{tenant_id} has been moved to provisioning but the job could "
+                       f"not be queued: {e}") from e
+        log.info("tenant %s provisioning job %s written by %s",
+                 tenant_id, job["job_id"], principal.subject)
+        return {"job": job, "tenant": _with_records(_must_get(tenant_id))}
+
+    @r.get("/tenants/{tenant_id}/records")
+    def dns_records(tenant_id: str,
+                    principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """The records to create, on their own, for pasting into a zone."""
+        t = _must_get(tenant_id)
+        return {"tenant_id": tenant_id, "records": _records_of(t)}
+
+    @r.get("/provisioning-jobs")
+    def provisioning_jobs(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
+        """The queue the runner reads, and its state.
+
+        Deliberately NOT mounted at /tenants/jobs: that would collide with
+        /tenants/{tenant_id} and be resolved by declaration order, so a tenant
+        legitimately called `jobs` would shadow it or be shadowed. A separate top
+        level path has no ordering to get wrong.
+
+        Observer-readable. A job stuck in `queued` because no runner is running is
+        exactly the outstanding thing §3.2 exists to surface, and noticing it needs
+        no authority to change it.
+        """
+        try:
+            return {"jobs": _jobs.jobs()}
+        except StoreUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e.args[0])) from e
 
     return r

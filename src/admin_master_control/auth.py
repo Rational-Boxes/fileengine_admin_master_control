@@ -61,6 +61,12 @@ log = logging.getLogger("admin_master_control.auth")
 
 #: Authentication methods that count as a SECOND factor. "pwd" is not among
 #: them, deliberately — it is the first.
+#: Factor names that count as a second factor in an `amr`.
+#:
+#: Only ever compared against an amr THIS SERVICE MINTED, never against caller
+#: input. It was once both, which was the hole: `login()` took the caller's string
+#: and, if it appeared here, appended it to the amr it then signed. Which methods
+#: a login may actually USE is Config.mfa_methods, deliberately narrower.
 SECOND_FACTORS = frozenset({"totp", "webauthn", "recovery", "email", "oauth"})
 
 
@@ -71,6 +77,25 @@ class AuthError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.status_code = status_code
+
+
+class DirectoryUnavailable(AuthError):
+    """The directory could not be ASKED — as distinct from having answered "no".
+
+    The two are opposite operator responses and they were indistinguishable at
+    first, because a failed search returned an empty role set. That is the same
+    mistake the tenant-state gate was written to avoid: "a failed lookup must not
+    claim a suspension". Here it claimed something narrower and more misleading —
+    that a named administrator holds no deployment role — about a directory that
+    in fact lists them in all five groups.
+
+    Still FAILS CLOSED: this is an AuthError, so nothing is authorised on it. The
+    difference is only in what it says, and 503 rather than 403 says "come back"
+    rather than "you have no authority here".
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 @dataclass(frozen=True)
@@ -165,13 +190,34 @@ class LdapDeploymentDirectory:
         try:
             conn = self._connect(self.bind_dn, self.bind_password)
         except Exception as e:  # noqa: BLE001
+            # RAISES rather than returning an empty set. An empty set means "this
+            # administrator holds no deployment role", which is a true and
+            # actionable statement; it must not also mean "the directory did not
+            # answer". See DirectoryUnavailable.
             log.warning("directory unreachable resolving roles for %s: %s", subject, e)
-            return frozenset()
+            raise DirectoryUnavailable(
+                f"the deployment directory could not be reached: {e}") from e
         try:
             # SUBTREE of the deployment OU ONLY. Never base_dn, never a tenant OU.
-            conn.search(self.role_base,
-                        f"(&(objectClass=groupOfNames)(member={dn}))",
-                        search_scope=ldap3.SUBTREE, attributes=["cn"])
+            ok = conn.search(self.role_base,
+                             f"(&(objectClass=groupOfNames)(member={dn}))",
+                             search_scope=ldap3.SUBTREE, attributes=["cn"])
+            if not ok:
+                # The search itself failed — the commonest cause is exactly the one
+                # that bit here: an ANONYMOUS or under-privileged bind against a
+                # directory that hides the role OU. OpenLDAP answers `noSuchObject`
+                # for a subtree the client may not see, so "the OU is missing" and
+                # "you may not read it" arrive identically and neither is "this
+                # user has no roles".
+                result = getattr(conn, "result", None) or {}
+                desc = result.get("description") or result.get("result") or "unknown"
+                log.error("role search under %s failed (%s) — bound as %r. A directory "
+                          "that hides the role OU returns nothing to an anonymous "
+                          "client; set AMC_LDAP_BIND_DN / AMC_LDAP_BIND_PASSWORD.",
+                          self.role_base, desc, self.bind_dn or "<anonymous>")
+                raise DirectoryUnavailable(
+                    f"the deployment role OU {self.role_base} could not be searched "
+                    f"({desc})")
             found = set()
             for entry in conn.entries:
                 cn = str(entry.cn.value) if entry.cn else ""
@@ -233,6 +279,80 @@ def mint_token(config: Config, principal: Principal, *, ttl_seconds: int = 3600)
     return jwt.encode(payload, config.jwt_secret, algorithm="HS256")
 
 
+#: Why a challenge token exists. Never a session, and never interchangeable.
+CHALLENGE_VERIFY = "verify"
+CHALLENGE_ENROLL = "enroll"
+
+
+def challenge_audience(config: Config) -> str:
+    """A DISTINCT audience for the pre-session challenge.
+
+    This is the structural half of "an un-enrolled administrator can reach
+    enrollment and nothing else". PyJWT is given the audience to validate, so a
+    challenge token presented to `principal_from_header` fails
+    signature-and-claim validation together — it is not a check that a later
+    refactor can drop, and there is no code path where a challenge is accepted as
+    a session because it never satisfies the session audience.
+    """
+    return f"{config.token_audience}:challenge"
+
+
+def mint_challenge(config: Config, principal: Principal, purpose: str) -> str:
+    """A short-lived token that permits ONE next step and nothing else.
+
+    It carries the roles so the step that follows does not re-read the directory,
+    but they are inert: nothing authorises off a challenge, because the gate on
+    every real route verifies against the session audience.
+    """
+    if not config.jwt_secret:
+        raise AuthError("no token secret configured",
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    if purpose not in (CHALLENGE_VERIFY, CHALLENGE_ENROLL):
+        raise AuthError(f"unknown challenge purpose {purpose!r}")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    payload = {
+        "sub": principal.subject,
+        "aud": challenge_audience(config),
+        "iss": "admin-master-control",
+        "iat": int(now.timestamp()),
+        "exp": int((now + _dt.timedelta(seconds=config.mfa_challenge_ttl_s)).timestamp()),
+        "purpose": purpose,
+        "roles": sorted(principal.roles),
+        # NO amr. A challenge has proved a password and nothing more, and an amr
+        # here would be the same self-assertion this rewrite removed.
+    }
+    return jwt.encode(payload, config.jwt_secret, algorithm="HS256")
+
+
+def verify_challenge(config: Config, token: str, expect: str) -> Principal:
+    """Verify a challenge token for a SPECIFIC purpose.
+
+    `expect` is required rather than optional: an enrollment challenge must not
+    complete a verification, nor the reverse. Someone already enrolled should not
+    be able to take the enrollment path and overwrite their factor with one they
+    chose after a password-only login.
+    """
+    if not config.jwt_secret:
+        raise AuthError("no token secret configured",
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    try:
+        claims = jwt.decode(token, config.jwt_secret, algorithms=["HS256"],
+                            audience=challenge_audience(config),
+                            options={"require": ["exp", "sub", "aud"]})
+    except jwt.ExpiredSignatureError as e:
+        raise AuthError("the challenge has expired; sign in again") from e
+    except Exception as e:  # noqa: BLE001
+        raise AuthError("invalid challenge") from e
+    if str(claims.get("purpose") or "") != expect:
+        raise AuthError(f"this challenge is not for {expect}")
+    subject = str(claims.get("sub") or "")
+    if not subject:
+        raise AuthError("invalid challenge")
+    return Principal(subject=subject,
+                     roles=frozenset(claims.get("roles") or ()),
+                     amr=("pwd",))
+
+
 def verify_token(config: Config, token: str) -> Principal:
     """Verify a token minted here. Refuses anything minted anywhere else.
 
@@ -269,9 +389,19 @@ def verify_token(config: Config, token: str) -> Principal:
 # ── login ──────────────────────────────────────────────────────────────────
 
 
-def login(config: Config, directory: DeploymentDirectory, subject: str, password: str,
-          *, second_factor: Optional[str] = None) -> Principal:
+def login(config: Config, directory: DeploymentDirectory, subject: str, password: str) -> Principal:
     """Authenticate an administrator and resolve their authority.
+
+    Returns a PASSWORD-ONLY principal (`amr = ["pwd"]`). It is not a session and
+    must not be minted as one while a second factor is required — `MfaGate`
+    decides what a correct password entitles someone to, and `mfa.py` says why
+    this function no longer takes the factor as an argument.
+
+    It used to take `second_factor` as a STRING, check it against a set of factor
+    NAMES, and append it to `amr`. Nothing verified a code, so anyone holding a
+    directory password could send {"second_factor":"totp"} and receive a fully
+    MFA-marked token. The parameter is gone rather than deprecated: leaving it
+    would leave the hole reachable.
 
     Order matters. The password is checked first, then the roles are read — a
     caller who cannot bind never learns whether the account holds authority,
@@ -288,12 +418,7 @@ def login(config: Config, directory: DeploymentDirectory, subject: str, password
         raise AuthError(f"{subject} holds no deployment role",
                         status_code=status.HTTP_403_FORBIDDEN)
 
-    amr = ["pwd"]
-    if second_factor:
-        if second_factor not in SECOND_FACTORS:
-            raise AuthError(f"unknown second factor {second_factor!r}")
-        amr.append(second_factor)
-    return Principal(subject=subject, roles=roles, amr=tuple(amr))
+    return Principal(subject=subject, roles=roles, amr=("pwd",))
 
 
 # ── the gate ───────────────────────────────────────────────────────────────
@@ -377,6 +502,12 @@ def directory_has_owner(directory: DeploymentDirectory, candidates: Iterable[str
     owner we can name", not "an owner exists" — and the difference is why a
     directory-only owner nobody has recorded still shows as drift rather than
     being silently relied upon.
+
+    Propagates :class:`DirectoryUnavailable` rather than answering False. "No
+    owner" and "could not read the role OU" need different operator responses —
+    the first is a provisioning gap, the second a bind credential — and readiness
+    reported the first about a directory containing an owner until they were
+    separated.
     """
     for subject in candidates:
         if SYSTEM_OWNER in directory.roles_of(subject):

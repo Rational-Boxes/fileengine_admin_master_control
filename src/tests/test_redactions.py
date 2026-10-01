@@ -32,6 +32,7 @@ import datetime as _dt
 import pytest
 from fastapi.testclient import TestClient
 
+from . import _harness
 from admin_master_control.administrators import AdministratorRegistry, bootstrap_owner
 from admin_master_control.app import build_app
 from admin_master_control.auth import StaticDeploymentDirectory
@@ -232,15 +233,19 @@ def _client(items=None):
     c.require_mfa = True
     c.monitor_host = "127.0.0.1"
     c.audit_url = "http://audit:8097"
+    # A second factor is required (the default), so it must also be CHECKABLE.
+    # Readiness reports "required but no store configured" otherwise, which is the
+    # point: enforcement that cannot reach its source refuses every login.
+    c.mfa_url = "http://ldap-manager:8093"
+    c.mfa_internal_secret = "internal-shared-secret"
     c.bootstrap_owner = ""
     return TestClient(build_app(c, reg, d, StaticQueue([]),
-                                StaticErasures(items or [])))
+                                StaticErasures(items or []), None,
+                                _harness.factors(SEC, OBS)))
 
 
 def _hdr(client, who=SEC):
-    r = client.post("/v1/auth/token",
-                    json={"subject": who, "password": "pw", "second_factor": "totp"})
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    return _harness.headers(client, who)
 
 
 def test_the_register_route_returns_the_buckets():

@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from . import _harness
 from admin_master_control.administrators import AdministratorRegistry, bootstrap_owner
 from admin_master_control.app import build_app
 from admin_master_control.auth import StaticDeploymentDirectory
@@ -53,6 +54,11 @@ def _cfg() -> Config:
     c.require_mfa = True
     c.monitor_host = "127.0.0.1"
     c.audit_url = "http://audit:8097"
+    # A second factor is required (the default), so it must also be CHECKABLE.
+    # Readiness reports "required but no store configured" otherwise, which is the
+    # point: enforcement that cannot reach its source refuses every login.
+    c.mfa_url = "http://ldap-manager:8093"
+    c.mfa_internal_secret = "internal-shared-secret"
     c.bootstrap_owner = ""
     return c
 
@@ -65,14 +71,15 @@ def _client(rows=None, source=None):
     reg = AdministratorRegistry()
     bootstrap_owner(reg, "james@rationalboxes.com")
     src = source if source is not None else StaticQueue(rows if rows is not None else [_row()])
-    return TestClient(build_app(_cfg(), reg, d, src)), src
+    return TestClient(build_app(_cfg(), reg, d, src, None, None,
+                                _harness.factors(SEC, OBS))), src
 
 
 def _hdr(client, who=SEC):
-    r = client.post("/v1/auth/token",
-                    json={"subject": who, "password": "pw", "second_factor": "totp"})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    # The real two-step login (see tests/_harness.py). A password alone no longer
+    # returns a token, and this walking the actual flow is what keeps these suites
+    # honest about the door in front of them.
+    return _harness.headers(client, who)
 
 
 def _move(client, hdr, iid, state, **body):
