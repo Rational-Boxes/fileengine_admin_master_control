@@ -423,7 +423,10 @@ def test_owner_does_not_open_an_observer_route():
 
 def test_owner_can_still_reach_the_route_that_needs_owner():
     owner_only = "owner.only@rationalboxes.com"
-    d = _dir(**{owner_only.replace("@", "_AT_"): [SYSTEM_OWNER]})
+    # The grantee has an ACCOUNT: a grant to an address no account answers to is
+    # refused (404) rather than recorded for an identity no login resolves to.
+    d = _dir(**{owner_only.replace("@", "_AT_"): [SYSTEM_OWNER],
+                "new_AT_rationalboxes.com": []})
     client = _client(directory=d)
     tok = _session(client, owner_only)["token"]
     r = client.post("/v1/grants",

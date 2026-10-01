@@ -340,3 +340,32 @@ def test_an_interface_suffix_is_not_a_tenant():
     with pytest.raises(t.TenantError):
         t.validate_tenant_id("acme-drive")
     assert t.base_tenant_id("acme-drive") == "acme"
+
+
+# ── a reserved id is refused at REQUEST, not when the existing tenant is listed ──
+#
+# Production 2026-10-01: the four tenants that predate this console were given a
+# base domain, and the whole tenant list answered 500 — `hostnames_for` ran the
+# full request-time validation, so the platform's own `default` tenant raised
+# "'default' is reserved by the platform" on every list.
+#
+# Reservation is a rule about what may be REQUESTED. A tenant that already exists
+# must still have hostnames to check; its id still has to be a valid hostname label.
+
+def test_an_existing_reserved_tenant_still_has_hostnames():
+    from admin_master_control.tenants import hostnames_for
+    assert hostnames_for("default", "example.com", ("", "drive")) == [
+        "default.example.com", "default-drive.example.com"]
+
+
+def test_a_reserved_id_is_still_refused_at_request():
+    from admin_master_control.tenants import RESERVED_IDS, TenantError, validate_tenant_id
+    assert "default" in RESERVED_IDS
+    with pytest.raises(TenantError, match="reserved"):
+        validate_tenant_id("default")
+
+
+def test_hostnames_still_refuse_an_id_that_is_not_a_valid_label():
+    from admin_master_control.tenants import TenantError, hostnames_for
+    with pytest.raises(TenantError, match="not a valid tenant id"):
+        hostnames_for("Bad_Id", "example.com")

@@ -14,7 +14,7 @@ const roles = ref<string[]>([])
 const error = ref('')
 const loading = ref(true)
 const busy = ref('')
-const history = ref<{ subject: string; rows: Record<string, any>[] } | null>(null)
+const history = ref<{ subject: string; label: string; rows: Record<string, any>[] } | null>(null)
 
 const grant = ref({ subject: '', role: '', reason: '' })
 
@@ -47,8 +47,14 @@ async function submitGrant() {
   }
 }
 
-async function revoke(subject: string, role: string) {
-  const reason = window.prompt(`Revoke ${role} from ${subject}. Why?`)
+/** How a person is named on screen: their address. The ledger and the API speak in
+ *  the directory's canonical uid, which for some accounts is not the address. */
+function label(a: { subject: string; email?: string }) {
+  return a.email || a.subject
+}
+
+async function revoke(subject: string, role: string, who: string = subject) {
+  const reason = window.prompt(`Revoke ${role} from ${who}. Why?`)
   if (reason === null) return
   busy.value = subject + role
   error.value = ''
@@ -62,10 +68,10 @@ async function revoke(subject: string, role: string) {
   }
 }
 
-async function showHistory(subject: string) {
+async function showHistory(subject: string, who: string = subject) {
   try {
     const h = await administrators.history(subject)
-    history.value = { subject, rows: h.grants ?? h.history ?? [] }
+    history.value = { subject, label: who, rows: h.grants ?? h.history ?? [] }
   } catch (e) {
     error.value = apiError(e)
   }
@@ -138,15 +144,18 @@ async function showHistory(subject: string) {
           <tbody>
             <tr v-for="a in data.administrators ?? []" :key="a.subject">
               <td>
-                <div>{{ a.subject }}</div>
-                <button class="link small" @click="showHistory(a.subject)">history</button>
+                <div>{{ label(a) }}</div>
+                <div v-if="a.email && a.email !== a.subject" class="muted small mono">
+                  uid {{ a.subject }}
+                </div>
+                <button class="link small" @click="showHistory(a.subject, label(a))">history</button>
               </td>
               <td>
                 <div class="row">
                   <span v-for="r in a.roles" :key="r" class="pill role">
                     {{ r }}
                     <button class="x" :disabled="busy === a.subject + r"
-                            :title="`Revoke ${r}`" @click="revoke(a.subject, r)">×</button>
+                            :title="`Revoke ${r}`" @click="revoke(a.subject, r, label(a))">×</button>
                   </span>
                   <span v-if="!a.roles?.length" class="muted small">none</span>
                 </div>
@@ -158,7 +167,7 @@ async function showHistory(subject: string) {
       </section>
 
       <section v-if="history" class="card">
-        <h2>{{ history.subject }} — every grant and revocation</h2>
+        <h2>{{ history.label }} — every grant and revocation</h2>
         <p class="hint">Append-only. A revocation is a new entry, not a deletion.</p>
         <table>
           <tbody>

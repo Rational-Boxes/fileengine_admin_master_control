@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.0",
     "PyJWT>=2.8",              # bearer verification; a DISTINCT audience from every tenant door
     "httpx>=0.27",             # reads other services through their APIs, never their schemas
+    "dnspython>=2.6",          # the DNS gate asks the zone's authoritative nameservers
 ]
 # Deliberately NOT depended on:
 #

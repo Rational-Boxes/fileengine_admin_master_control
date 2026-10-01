@@ -595,3 +595,77 @@ describe('certificates, per subdomain', () => {
     expect(w.findAll('button').some((b) => b.text() === 'Verify')).toBe(false)
   })
 })
+
+// "not checked" is where an administrator looks, so it is where the check is run.
+// Found in production 2026-10-01: the status read as a dead label beside a Verify
+// button in another column, and the expectation was that pressing the status runs it.
+describe('a "not checked" status runs the check', () => {
+  function notChecked(w: ReturnType<typeof mount>) {
+    return w.findAll('tr.iface button').filter((b) => b.text() === 'not checked')
+  }
+
+  it('is a button for anyone the server lets verify (system_observer)', async () => {
+    const w = await view([row({ tenant_id: 'acme', state: 'live', admits_logins: true })],
+                         [SYSTEM_OBSERVER])
+    // Two hostnames x (DNS, certificate) — every unchecked cell is pressable.
+    expect(notChecked(w)).toHaveLength(4)
+  })
+
+  it('runs the tenant verify — DNS and TLS on every subdomain — and refreshes', async () => {
+    const verify = vi.spyOn(tenants, 'verify').mockResolvedValue(row())
+    const w = await view([row({ tenant_id: 'acme', state: 'live', admits_logins: true })],
+                         [SYSTEM_OBSERVER])
+    const list = vi.mocked(tenants.list)
+    const before = list.mock.calls.length
+    await notChecked(w)[1].trigger('click')
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledWith('acme'))
+    await vi.waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(before))
+  })
+
+  it('stays plain text for a role the server would refuse', async () => {
+    const w = await view([row({ tenant_id: 'acme', state: 'live', admits_logins: true })],
+                         [SYSTEM_TENANTS])
+    expect(notChecked(w)).toHaveLength(0)
+    expect(w.findAll('tr.iface')[0].text()).toContain('not checked')
+  })
+
+  it('a checked result is not turned into a button', async () => {
+    const w = await view([row({
+      tenant_id: 'acme', state: 'live', admits_logins: true,
+      dns: { ok: true, checks: [
+        { hostname: 'acme.example.com', ok: true, detail: '' },
+        { hostname: 'acme-drive.example.com', ok: true, detail: '' },
+      ] } as TenantView['dns'],
+    })], [SYSTEM_OBSERVER])
+    // DNS is checked on both rows; only the two certificate cells remain pressable.
+    expect(notChecked(w)).toHaveLength(2)
+  })
+})
+
+// A failed load is not an empty registry. Production 2026-10-01: the list endpoint
+// answered 500 and the page said "No tenants in the registry ... check that
+// AMC_CORE_PG_* points at the core's database" — sending an operator to debug a
+// database connection that was fine.
+describe('when the list cannot be loaded', () => {
+  async function failing() {
+    setActivePinia(createPinia())
+    useSession().adopt({ token: 't', subject: 'ten@x', roles: [SYSTEM_OBSERVER],
+                         amr: ['pwd', 'totp'] })
+    vi.spyOn(tenants, 'list').mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 500'),
+                    { response: { status: 500, data: { detail: 'Internal Server Error' } } }))
+    const w = mount(TenantsView, { global: { stubs } })
+    await vi.waitFor(() => expect(w.text()).not.toContain('Loading'))
+    return w
+  }
+
+  it('does not claim the registry is empty', async () => {
+    const w = await failing()
+    expect(w.text()).not.toContain('No tenants in the registry')
+  })
+
+  it('says the list could not be loaded', async () => {
+    const w = await failing()
+    expect(w.text()).toContain('could not be loaded')
+  })
+})
