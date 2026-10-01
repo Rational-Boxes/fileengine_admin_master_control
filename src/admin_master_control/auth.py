@@ -174,8 +174,8 @@ class LdapDeploymentDirectory:
         return ldap3.Connection(server, user=dn, password=password,
                                 auto_bind=True, raise_exceptions=False)
 
-    def _resolve(self, name: str) -> Optional[tuple[str, str]]:
-        """``(uid, dn)`` of the ONE account whose uid or mail is ``name``.
+    def _resolve(self, name: str) -> Optional[tuple[str, str, str]]:
+        """``(uid, dn, mail)`` of the ONE account whose uid or mail is ``name``.
 
         None when no account answers to it, and ALSO when more than one does:
         two accounts behind one sign-in name is a directory defect, and picking
@@ -203,7 +203,7 @@ class LdapDeploymentDirectory:
             v = escape_filter_chars(name)
             conn.search(self.user_base,
                         f"(&(objectClass=inetOrgPerson)(|(uid={v})(mail={v})))",
-                        search_scope=ldap3.SUBTREE, attributes=["uid"])
+                        search_scope=ldap3.SUBTREE, attributes=["uid", "mail"])
             # NOT the boolean: ldap3 returns False for "no entries" even when the
             # search succeeded. The result code is what separates "nobody by that
             # name" from "could not look".
@@ -226,7 +226,11 @@ class LdapDeploymentDirectory:
                 uid = uid[0] if uid else None
             if not uid:
                 return None
-            return str(uid), str(e.entry_dn)
+            mail = getattr(e, "mail", None)
+            mail = mail.value if mail is not None else None
+            if isinstance(mail, (list, tuple)):
+                mail = mail[0] if mail else None
+            return str(uid), str(e.entry_dn), str(mail or "")
         finally:
             try:
                 conn.unbind()
@@ -240,6 +244,11 @@ class LdapDeploymentDirectory:
     def _dn_of(self, subject: str) -> Optional[str]:
         r = self._resolve(subject)
         return r[1] if r else None
+
+    def mail_of(self, subject: str) -> str:
+        """The account's email, for DISPLAY. Empty when it has none."""
+        r = self._resolve(subject)
+        return r[2] if r else ""
 
     def authenticate(self, subject: str, password: str) -> bool:
         if not subject or not password:
@@ -342,6 +351,12 @@ class StaticDeploymentDirectory:
             return name
         by_mail = {k.lower(): v for k, v in self.emails.items()}
         return by_mail.get(name.lower())
+
+    def mail_of(self, subject: str) -> str:
+        for mail, uid in self.emails.items():
+            if uid == subject:
+                return mail
+        return subject if "@" in subject else ""
 
     def authenticate(self, subject: str, password: str) -> bool:
         return bool(password) and self.passwords.get(subject) == password

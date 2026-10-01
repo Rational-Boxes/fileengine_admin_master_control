@@ -129,8 +129,14 @@ def reachable_by_hostname(tenant_id: str) -> bool:
     return bool(tenant_id) and base_tenant_id(tenant_id) == tenant_id
 
 
-def validate_tenant_id(tenant_id: str) -> str:
-    """§5.3.1's strict pattern, applied at the boundary."""
+def validate_tenant_id(tenant_id: str, *, allow_reserved: bool = False) -> str:
+    """§5.3.1's strict pattern, applied at the boundary.
+
+    ``allow_reserved`` is for tenants that ALREADY EXIST. Reservation is a rule about
+    what may be requested; the platform's own `default` tenant is reserved precisely
+    because it exists, and it still needs hostnames to check. The pattern is enforced
+    either way — the id becomes a hostname label.
+    """
     if not tenant_id:
         raise TenantError("a tenant id is required")
     if not TENANT_ID.match(tenant_id):
@@ -138,7 +144,7 @@ def validate_tenant_id(tenant_id: str) -> str:
             f"{tenant_id!r} is not a valid tenant id: lower-case letters, digits "
             f"and hyphens, starting with a letter, 2-31 characters. It becomes a "
             f"schema name, an LDAP OU, a hostname and a container label.")
-    if tenant_id in RESERVED_IDS:
+    if tenant_id in RESERVED_IDS and not allow_reserved:
         raise TenantError(f"{tenant_id!r} is reserved by the platform")
     return tenant_id
 
@@ -190,7 +196,11 @@ def hostnames_for(tenant_id: str, base_domain: str,
     gets through the first certificate and stops on the second, by which point the run
     is half done and the domain's issuance limit has been spent.
     """
-    validate_tenant_id(tenant_id)
+    # Shape, not reservation: this derives names for tenants that exist, including
+    # the reserved `default`. Requests are refused a reserved id in the API, before
+    # anything is derived for them. Running the request rule here 500'd the whole
+    # tenant list in production once `default` had a base domain.
+    validate_tenant_id(tenant_id, allow_reserved=True)
     if not base_domain:
         raise TenantError("a base domain is required")
     return [hostname_for(tenant_id, base_domain, sfx) for sfx in interfaces]
@@ -304,6 +314,103 @@ class SystemResolver:
             return (), False, f"does not resolve locally ({e.strerror or e})"
         addrs = tuple(sorted({i[4][0] for i in infos}))
         return addrs, False, "answered by the local resolver, which is not authoritative"
+
+
+@dataclass
+class AuthoritativeResolver:
+    """Asks the ZONE'S OWN nameservers, and believes only an authoritative answer.
+
+    What §3.4a asks for and SystemResolver could not give. For each hostname:
+    find the zone it lives in, find that zone's NS set and their addresses, and send
+    the query to each nameserver in turn WITH RECURSION OFF. An answer counts only if
+    it carries the AA (authoritative answer) flag; an authoritative NXDOMAIN is "no
+    record" — the case where waiting is the right move.
+
+    Its absence was visible in production on 2026-10-01: every hostname of every
+    tenant showed a red "no" reading "answered by the local resolver", for names that
+    resolved perfectly, because the only resolver was the honest placeholder.
+
+    ``zone_for``, ``nameservers_of`` and ``query`` are injectable so the decision
+    logic is tested without a network; the defaults use dnspython.
+    """
+
+    timeout: float = 3.0
+    zone_for: Optional[object] = None          # hostname -> zone name
+    nameservers_of: Optional[object] = None    # zone -> [(ns name, ip)]
+    query: Optional[object] = None             # (message, ip) -> response
+
+    def _zone(self, hostname: str) -> str:
+        if self.zone_for is not None:
+            return self.zone_for(hostname)
+        import dns.resolver
+        return dns.resolver.zone_for_name(hostname).to_text()
+
+    def _nameservers(self, zone: str) -> list:
+        if self.nameservers_of is not None:
+            return list(self.nameservers_of(zone))
+        import dns.resolver
+        out = []
+        for ns in dns.resolver.resolve(zone, "NS", lifetime=self.timeout):
+            name = ns.target.to_text()
+            try:
+                for a in dns.resolver.resolve(name, "A", lifetime=self.timeout):
+                    out.append((name, a.to_text()))
+            except Exception:  # noqa: BLE001 - one unresolvable NS is not fatal
+                continue
+        return out
+
+    def _ask(self, msg, ip: str):
+        if self.query is not None:
+            return self.query(msg, ip)
+        import dns.query
+        return dns.query.udp(msg, ip, timeout=self.timeout)
+
+    def addresses(self, hostname: str) -> tuple[tuple[str, ...], bool, str]:
+        import dns.exception
+        import dns.flags
+        import dns.message
+        import dns.rcode
+        import dns.rdatatype
+
+        name = hostname.rstrip(".") + "."
+        try:
+            servers = self._nameservers(self._zone(name))
+        except Exception as e:  # noqa: BLE001
+            return (), False, f"could not find the zone's nameservers ({e})"
+        if not servers:
+            return (), False, "could not find the zone's nameservers"
+
+        unanswered = []
+        for ns_name, ip in servers:
+            q = dns.message.make_query(name, "A")
+            q.flags &= ~dns.flags.RD          # ask the zone, not a recursive resolver
+            try:
+                r = self._ask(q, ip)
+            except (dns.exception.DNSException, OSError) as e:
+                unanswered.append(f"{ns_name.rstrip('.')}: {type(e).__name__}")
+                continue
+            if not (r.flags & dns.flags.AA):
+                unanswered.append(f"{ns_name.rstrip('.')}: not authoritative")
+                continue
+            if r.rcode() == dns.rcode.NXDOMAIN:
+                return (), True, "no record"
+            if r.rcode() != dns.rcode.NOERROR:
+                unanswered.append(f"{ns_name.rstrip('.')}: {dns.rcode.to_text(r.rcode())}")
+                continue
+            addrs = sorted({rd.to_text() for rrset in r.answer
+                            if rrset.rdtype == dns.rdatatype.A for rd in rrset})
+            if addrs:
+                return tuple(addrs), True, ""
+            # A CNAME with its target outside this answer: follow it once, the way a
+            # resolver would — the CA follows it too.
+            targets = [rd.target.to_text() for rrset in r.answer
+                       if rrset.rdtype == dns.rdatatype.CNAME for rd in rrset]
+            if targets and targets[0] != name:
+                got, auth, detail = self.addresses(targets[0])
+                return got, auth, detail or f"via CNAME {targets[0].rstrip('.')}"
+            return (), True, "no record"
+        return (), False, ("no authoritative nameserver answered ("
+                           + "; ".join(unanswered) + ")")
 
 
 @dataclass

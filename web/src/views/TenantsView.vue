@@ -7,12 +7,16 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { apiError } from '@/services/client'
 import { tenants, type TenantView } from '@/services/api'
-import { SYSTEM_TENANTS, useSession } from '@/stores/session'
+import { SYSTEM_OBSERVER, SYSTEM_TENANTS, useSession } from '@/stores/session'
 
 const s = useSession()
 const rows = ref<TenantView[]>([])
 const error = ref('')
 const loading = ref(true)
+// Whether the LAST load failed. Distinct from an empty result: a failed request
+// leaves `rows` empty too, and the empty-registry message then sends an operator
+// to debug a database connection that is fine (production, 2026-10-01).
+const loadFailed = ref(false)
 const creating = ref(false)
 const busy = ref('')
 
@@ -57,6 +61,10 @@ const statesPresent = computed(() =>
 )
 
 const mayAct = computed(() => s.has(SYSTEM_TENANTS))
+// Running a check is an OBSERVER act on the server (POST /tenants/{id}/verify), so
+// it is offered on that role — not on mayAct, which would hide it from the people
+// the API already lets press it.
+const mayCheck = computed(() => s.has(SYSTEM_OBSERVER))
 
 /** Tenants, with interface-shaped rows FOLDED UNDER the tenant they belong to.
  *
@@ -198,8 +206,10 @@ async function refresh() {
   error.value = ''
   try {
     rows.value = await tenants.list()
+    loadFailed.value = false
   } catch (e) {
     error.value = apiError(e)
+    loadFailed.value = true
   } finally {
     loading.value = false
   }
@@ -371,7 +381,12 @@ function stateClass(state: string) {
          Spelling the conditions out costs a few repeated clauses and makes the group
          insertion-proof. -->
     <p v-if="loading" class="empty">Loading…</p>
-    <p v-if="!loading && !rows.length" class="empty">
+    <p v-if="!loading && loadFailed && !rows.length" class="empty">
+      The tenant list could not be loaded<template v-if="error"> — {{ error }}</template>.
+      This is not an empty registry; try again, or sign in again if your session has
+      expired.
+    </p>
+    <p v-if="!loading && !loadFailed && !rows.length" class="empty">
       No tenants in the registry. If the estate is not empty, check that
       AMC_CORE_PG_* points at the core's database.
     </p>
@@ -553,6 +568,14 @@ function stateClass(state: string) {
                   {{ iface.check.detail }}
                 </div>
               </template>
+              <!-- "not checked" is where an administrator looks, so it is where the
+                   check is run: the tenant's verify, DNS and TLS on every subdomain. -->
+              <button v-else-if="mayCheck" class="linkbtn small"
+                      :disabled="busy === g.tenant.tenant_id"
+                      title="Check DNS and certificates on every subdomain of this tenant"
+                      @click="act(g.tenant.tenant_id, () => tenants.verify(g.tenant.tenant_id))">
+                {{ busy === g.tenant.tenant_id ? 'checking…' : 'not checked' }}
+              </button>
               <span v-else class="muted small">not checked</span>
             </td>
             <td class="dns">
@@ -567,6 +590,12 @@ function stateClass(state: string) {
                   {{ iface.cert.issuer }}
                 </div>
               </template>
+              <button v-else-if="mayCheck" class="linkbtn small"
+                      :disabled="busy === g.tenant.tenant_id"
+                      title="Check DNS and certificates on every subdomain of this tenant"
+                      @click="act(g.tenant.tenant_id, () => tenants.verify(g.tenant.tenant_id))">
+                {{ busy === g.tenant.tenant_id ? 'checking…' : 'not checked' }}
+              </button>
               <span v-else class="muted small">not checked</span>
             </td>
             <td v-if="mayAct"></td>
@@ -707,6 +736,21 @@ tr.folded .pill {
 .actions {
   white-space: nowrap;
 }
+/* A status that is also its own action: reads as the muted label it replaces,
+   and shows it can be pressed. */
+.linkbtn {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.linkbtn:hover:not(:disabled),
+.linkbtn:focus-visible { color: var(--primary); text-decoration-style: solid; }
+.linkbtn:disabled { cursor: progress; opacity: 0.7; }
 .btn.sm {
   padding: 0.3rem 0.6rem;
   font-size: 0.82rem;

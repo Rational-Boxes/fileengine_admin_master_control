@@ -39,7 +39,7 @@ from .redactions import ErasureSource, StaticErasures
 from .job_store import JobStore, from_config as job_store_from_config
 from .tls import SystemTlsProbe
 from .registry import TenantRegistry, from_config as registry_from_config
-from .tenants import Resolver, SystemResolver
+from .tenants import AuthoritativeResolver, Resolver
 from .auth import (
     DeploymentDirectory,
     DirectoryUnavailable,
@@ -113,11 +113,12 @@ def build_app(config: Config,
     # honest (there are no items it can see) where a 503 would say the feature is
     # broken.
     app.state.erasures = erasures if erasures is not None else StaticErasures()
-    # The LOCAL resolver, which reports itself as non-authoritative — so the DNS
-    # gate will not pass on its word and an administrator must use the recorded
-    # override. That is deliberate: a local lookup masquerading as proof is how a
-    # premature run burns the domain's certificate rate limit.
-    app.state.resolver = resolver if resolver is not None else SystemResolver()
+    # The ZONE'S OWN nameservers, believed only on an authoritative (AA) answer —
+    # what the gate always asked for. Until 2026-10-01 this was SystemResolver, the
+    # honest placeholder that reports every answer as non-authoritative, so every
+    # hostname of every tenant showed "no" for names that resolved perfectly. A local
+    # lookup is still never proof: the CA does not see this host's resolver.
+    app.state.resolver = resolver if resolver is not None else AuthoritativeResolver()
     # THE TENANT REGISTRY IS THE CORE'S TABLE. This console reads and writes
     # `public.tenants` rather than keeping a second one: it already modelled
     # requested -> awaiting_dns -> provisioning -> live, the doors compare against

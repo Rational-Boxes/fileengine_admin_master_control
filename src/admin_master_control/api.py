@@ -43,6 +43,7 @@ from .auth import (
     CHALLENGE_VERIFY,
     AuthError,
     DeploymentDirectory,
+    DirectoryUnavailable,
     Principal,
     login as do_login,
     make_require,
@@ -371,6 +372,39 @@ def build_router(config: Config, registry: AdministratorRegistry,
 
     # ── who holds authority ────────────────────────────────────────────────
 
+    # ── naming: SHOWN by email, RECORDED by canonical uid ─────────────────────
+    #
+    # The login resolves uid-or-email to the canonical uid, so the ledger must be
+    # written in the same terms — or a grant typed as an address records authority
+    # for an identity no login ever becomes. Display goes the other way: people
+    # know each other by address, not by the directory's uid.
+
+    def _canonical(name: str, *, recorded_ok: bool = False) -> str:
+        resolve = getattr(directory, "canonical", None)
+        if resolve is None:
+            return name
+        uid = resolve(name)
+        if uid is not None:
+            return uid
+        if recorded_ok and name in registry.subjects():
+            # A ledger entry whose account has since left the directory. It must
+            # stay revocable, or authority recorded for a departed person could
+            # never be withdrawn.
+            return name
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"no account in the directory answers to {name!r}")
+
+    def _email(subject: str) -> str:
+        mail_of = getattr(directory, "mail_of", None)
+        if mail_of is not None:
+            try:
+                got = mail_of(subject)
+                if got:
+                    return got
+            except DirectoryUnavailable:
+                pass
+        return subject if "@" in subject else ""
+
     @r.get("/administrators")
     def administrators(principal: Principal = Depends(require(SYSTEM_OBSERVER))):
         """Current holders, and the drift between the directory and the ledger.
@@ -379,7 +413,8 @@ def build_router(config: Config, registry: AdministratorRegistry,
         because a console that shows holders without showing that the two
         stores disagree is showing a number somebody will trust.
         """
-        current = [{"subject": s, "roles": rs} for s, rs in summarise(registry)]
+        current = [{"subject": s, "email": _email(s), "roles": rs}
+                   for s, rs in summarise(registry)]
         dir_roles = {s: directory.roles_of(s)
                      for s in (registry.subjects() | {a["subject"] for a in current})}
         led_roles = {s: registry.roles_of(s) for s in registry.subjects()}
@@ -397,6 +432,12 @@ def build_router(config: Config, registry: AdministratorRegistry,
         which §6.3 exists to make answerable. Revocations are entries, so the
         history of a role somebody no longer holds is still here.
         """
+        # The list links by uid, but an address typed into the URL names the same
+        # person; fall back to the name as recorded for a departed account.
+        try:
+            subject = _canonical(subject, recorded_ok=True)
+        except HTTPException:
+            pass
         entries = registry.history(subject)
         if not entries:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
@@ -437,7 +478,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
             # The DIRECTORY-verified roles, from the gate that just allowed
             # this call — not the ledger's own view, which may not yet record a
             # grant for an owner the directory already honours.
-            g = registry.grant(body.subject, body.role, by=principal.subject,
+            g = registry.grant(_canonical(body.subject), body.role, by=principal.subject,
                                reason=body.reason, authority=principal.roles)
         except RoleError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -451,7 +492,8 @@ def build_router(config: Config, registry: AdministratorRegistry,
         """Record a revocation. Appends; never edits."""
         authorised_as = principal.authorising(SYSTEM_OWNER)
         try:
-            g = registry.revoke(body.subject, body.role, by=principal.subject,
+            g = registry.revoke(_canonical(body.subject, recorded_ok=True), body.role,
+                                by=principal.subject,
                                 reason=body.reason, authority=principal.roles)
         except RoleError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
