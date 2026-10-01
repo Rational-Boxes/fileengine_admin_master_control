@@ -182,6 +182,7 @@ def test_only_phase_one_routes_are_mounted():
         # because it is an idempotent replacement of a label — and it renames the
         # LABEL only; tenant_id reaches four interpreters and is immutable.
         ("PUT", "/v1/tenants/{tenant_id}/display-name"),
+        ("POST", "/v1/tenants/{tenant_id}/state"),
         ("POST", "/v1/tenants/{tenant_id}/dns-check"),
         # DNS *and* TLS on every subdomain, primary and service alike. On the observer
         # baseline: it resolves names and opens TLS connections and changes nothing, and
@@ -240,6 +241,10 @@ def test_every_write_is_a_record_or_a_request_never_an_execution():
         # Records a LABEL in the registry. Renames nothing that anything is keyed
         # on: the identifier is immutable.
         "/v1/tenants/{tenant_id}/display-name",
+        # Suspends or resumes: live <-> suspended ONLY, in the core's registry that
+        # the doors read. Reversible and destroys nothing — which is why it may sit
+        # in this list beside a test asserting nothing here can destroy a tenant.
+        "/v1/tenants/{tenant_id}/state",
         # REQUESTS work. The one route whose effect leaves this application, and
         # it leaves as a queued job for a runner that holds the credentials this
         # application deliberately does not.

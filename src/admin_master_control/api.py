@@ -68,6 +68,8 @@ from .registry import (
     PROVISIONING,
     RegistryRefused,
     RegistryUnavailable,
+    STATE_TRANSITIONS,
+    SUSPENDED,
     StaticTenantRegistry,
     TenantRegistry,
     schema_name_for,
@@ -142,6 +144,18 @@ class DisplayNameBody(BaseModel):
 
 class OverrideBody(BaseModel):
     reason: str
+
+
+class StateChangeBody(BaseModel):
+    """Suspend (`state: "suspended"`) or resume (`state: "live"`).
+
+    No actor field: the acting administrator is the authenticated caller.
+    `confirm` is the tenant id TYPED, required to suspend — §3.4b: the realistic
+    failure is the right operation on the wrong tenant.
+    """
+    state: str
+    reason: str = ""
+    confirm: str = ""
 
 
 class GrantRequest(BaseModel):
@@ -843,6 +857,47 @@ def build_router(config: Config, registry: AdministratorRegistry,
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail=str(e)) from e
         log.info("tenant %s display name set by %s", tenant_id, principal.subject)
+        return _with_records(t)
+
+    @r.post("/tenants/{tenant_id}/state")
+    def change_state(tenant_id: str, body: StateChangeBody,
+                     principal: Principal = Depends(require(SYSTEM_TENANTS))):
+        """Suspend or resume a tenant — §3.4b's reversible phase.
+
+        The write lands in the core's registry, the row the doors read through
+        GetTenantState, so this IS the suspension: every door that checks tenant
+        state refuses the tenant once its short cache expires. Nothing is destroyed.
+        Only live <-> suspended moves here; anything else is 409.
+        """
+        principal.authorising(SYSTEM_TENANTS)
+        to = body.state.strip().lower()
+        if to not in {b for _, b in STATE_TRANSITIONS}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="only 'suspended' and 'live' can be set here")
+        reason = body.reason.strip()
+        if not reason:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="a reason is required — it is what the next "
+                                       "operator reads on this tenant")
+        if len(reason) > 500:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="that reason is too long (500 characters)")
+        if to == SUSPENDED and body.confirm != tenant_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"type the tenant id ({tenant_id}) to suspend it")
+        current = _must_get(tenant_id)
+        try:
+            t = _registry.set_state(tenant_id, to, by=principal.subject, note=reason)
+        except RegistryUnavailable as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(e)) from e
+        if t is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{tenant_id} is {current.state.replace('_', ' ')}; only a live "
+                       f"tenant can be suspended and only a suspended one resumed")
+        log.warning("tenant %s %s by %s: %s", tenant_id,
+                    "SUSPENDED" if to == SUSPENDED else "RESUMED", principal.subject, reason)
         return _with_records(t)
 
     @r.post("/tenants/{tenant_id}/dns-check")

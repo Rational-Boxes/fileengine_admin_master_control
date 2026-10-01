@@ -52,6 +52,7 @@ leaving it there is both truthful and safe.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import re
@@ -82,6 +83,11 @@ REGISTRY_STATES = (REQUESTED, AWAITING_DNS, PROVISIONING, LIVE,
 #: fails with `syntax error at or near "$4"`. The in-memory double happily passed
 #: every test that exercised it; only the live Postgres run found this.
 CLAIMABLE = [REQUESTED, AWAITING_DNS]
+
+#: The ONLY transitions the state operation performs, as (from, to). Suspend and
+#: resume — §3.4b's reversible phase. Provisioning has its own claimed, gated path,
+#: and decommissioning is destructive and is not this operation.
+STATE_TRANSITIONS = {(LIVE, SUSPENDED), (SUSPENDED, LIVE)}
 
 #: The one state that admits a login. Mirrored from the doors' policy header for
 #: DISPLAY only, and asserted against that header by a test — a second copy of a
@@ -238,6 +244,7 @@ class TenantRegistry(Protocol):
     def record_dns(self, tenant_id: str, verdict: dict) -> Optional[Tenant]: ...
     def record_tls(self, tenant_id: str, verdict: dict) -> Optional[Tenant]: ...
     def record_override(self, tenant_id: str, by: str, reason: str) -> Optional[Tenant]: ...
+    def set_state(self, tenant_id: str, to: str, *, by: str, note: str) -> Optional[Tenant]: ...
     def claim_for_provisioning(self, tenant_id: str, by: str) -> Optional[Tenant]: ...
     def attach_job(self, tenant_id: str, job_id: str) -> None: ...
 
@@ -458,6 +465,28 @@ class PostgresTenantRegistry:
             conn.commit()
         return _row(row) if row else None
 
+    def set_state(self, tenant_id: str, to: str, *, by: str, note: str) -> Optional[Tenant]:
+        """Suspend or resume, ATOMICALLY, or return None.
+
+        ONE conditional UPDATE: the allowed from-states are a predicate the database
+        evaluates, so two operators pressing at once cannot both win, and a row that
+        moved since the page was drawn is refused rather than overwritten. The doors
+        read this same row through the core, so this write IS the suspension.
+        """
+        froms = [a for a, b in STATE_TRANSITIONS if b == to]
+        if not froms:
+            return None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE public.tenants SET state = %s, state_since = now(), "
+                    f"state_by = %s, state_note = %s, updated_at = now() "
+                    f"WHERE tenant_id = %s AND state = ANY(%s) RETURNING {_COLS}",
+                    (to, by, note, tenant_id, froms))
+                row = cur.fetchone()
+            conn.commit()
+        return _row(row) if row else None
+
     def claim_for_provisioning(self, tenant_id: str, by: str) -> Optional[Tenant]:
         """Move a gated request to `provisioning`, ATOMICALLY, or return None.
 
@@ -573,6 +602,14 @@ class StaticTenantRegistry:
         if t is None or t.state not in CLAIMABLE:
             return None
         return self._replace(tenant_id, override_by=by, override_reason=reason)
+
+    def set_state(self, tenant_id: str, to: str, *, by: str, note: str) -> Optional[Tenant]:
+        self._guard()
+        t = self.rows.get(tenant_id)
+        if t is None or (t.state, to) not in STATE_TRANSITIONS:
+            return None
+        return self._replace(tenant_id, state=to, state_by=by, state_note=note,
+                             state_since=_dt.datetime.now(_dt.timezone.utc).isoformat())
 
     def claim_for_provisioning(self, tenant_id: str, by: str) -> Optional[Tenant]:
         self._guard()
