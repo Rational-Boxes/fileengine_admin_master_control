@@ -317,6 +317,35 @@ def test_adding_an_interface_adds_a_hostname_a_record_and_a_check():
     assert len(v.checks) == 4
 
 
+def test_media_links_add_a_third_hostname_record_and_gate():
+    # Production configures AMC_TENANT_INTERFACES="drive,media" when media links are
+    # on (MEDIA_SHARE.md): <tenant>-media is share_service's media origin.
+    ifaces = t.interface_suffixes("drive,media")
+    assert ifaces == ("", "drive", "media")
+    assert t.hostnames_for("default", "proximafilevault.com", ifaces) == [
+        "default.proximafilevault.com", "default-drive.proximafilevault.com",
+        "default-media.proximafilevault.com"]
+    assert [r.name for r in t.records_for("acme", BASE, ADDR, ifaces)] == \
+        t.hostnames_for("acme", BASE, ifaces)
+
+
+def test_a_tenant_without_its_media_record_may_not_provision():
+    # The ingress role requests a -media certificate whenever media links are on; a
+    # gate that did not know about it would let provisioning stop half done at certbot.
+    ifaces = t.interface_suffixes("drive,media")
+    two_of_three = t.StaticResolver(
+        answers={h: (ADDR,) for h in t.hostnames_for("acme", BASE, ifaces)[:2]})
+    v = t.check_dns("acme", BASE, ADDR, two_of_three, ifaces)
+    assert not v.ok
+    assert f"acme-media.{BASE}" in v.blocking_reason
+    assert [c.ok for c in v.checks] == [True, True, False]
+
+
+def test_media_is_reserved_as_a_tenant_id():
+    with pytest.raises(t.TenantError):
+        t.validate_tenant_id("media")
+
+
 def test_a_new_interface_is_blocking_until_its_record_exists():
     # The point of threading the list through the gate: an interface nobody has created
     # a record for must STOP provisioning, not be discovered at the certificate step.

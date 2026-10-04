@@ -111,6 +111,14 @@ const allGroups = computed(() => {
  * "DNS: not ready" on the parent hides which hostname is missing, and the causes need
  * opposite responses: "no record" improves by waiting, a wrong address never does.
  */
+/** What each known interface subdomain serves, for the row's tooltip. Unknown
+ * suffixes still render — the label comes from the hostname, not from this table. */
+const ROLE_TITLES: Record<string, string> = {
+  tenant: 'The web app, its API and sign-in',
+  drive: 'WebDAV',
+  media: 'Media links: streaming and embeds (share_service media door)',
+}
+
 function interfacesOf(t: TenantView) {
   const dns = new Map((t.dns?.checks ?? []).map((c) => [c.hostname, c]))
   const tls = new Map((t.tls?.checks ?? []).map((c) => [c.hostname, c]))
@@ -551,7 +559,7 @@ function stateClass(state: string) {
             <td>
               <span class="tree" aria-hidden="true">└</span>
               <span class="mono">{{ iface.host }}</span>
-              <span class="pill role">{{ iface.role }}</span>
+              <span class="pill role" :title="ROLE_TITLES[iface.role] ?? ''">{{ iface.role }}</span>
             </td>
             <td colspan="2" class="muted small">
               its own record and certificate

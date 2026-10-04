@@ -84,6 +84,7 @@ TENANT_ID = re.compile(r"^[a-z][a-z0-9]{1,30}$")
 
 RESERVED_IDS = frozenset({
     "login", "www", "api", "mcp", "admin", "docs", "cms", "dav", "drive",
+    "media",     # <tenant>-media: share_service's media origin (MEDIA_SHARE.md)
     "default",   # exists on every deployment
 })
 
@@ -159,6 +160,11 @@ def validate_tenant_id(tenant_id: str, *, allow_reserved: bool = False) -> str:
 #: playbook must obtain, so the DNS gate has to know about it or the run gets through
 #: the first certificate and stops on the second — half done, and having spent
 #: issuance from a limit shared by every tenant on the domain.
+#:
+#: Deployments with media links on configure "drive,media": the media door is a
+#: separate origin on purpose (it alone answers with real media types), so each
+#: tenant carries a third record and certificate. AMC_TENANT_INTERFACES is set from
+#: share_media_enabled by the Ansible role, so the gate follows the feature switch.
 #:
 #: WebDAV has its own host because its verbs cannot sit behind a path prefix. MCP and
 #: the document server are path-routable today and so do not, but that is a current

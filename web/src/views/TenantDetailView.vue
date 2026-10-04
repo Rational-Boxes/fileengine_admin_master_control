@@ -131,7 +131,8 @@ function copyZone() {
             <h3 v-else>Resume {{ t.tenant_id }}?</h3>
             <p v-if="suspending" class="small">
               Every door that checks tenant state refuses this tenant within about a
-              minute: sign-in, the web app and its API, and WebDAV. Nothing is
+              minute: sign-in, the web app and its API, WebDAV, and shared links
+              (media links included). Nothing is
               destroyed, and resuming restores access exactly as it was.
               Services that verify session tokens on their own — search, discussions,
               shares — keep honouring sessions issued before now until those expire.
