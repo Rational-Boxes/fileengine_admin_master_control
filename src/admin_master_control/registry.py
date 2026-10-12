@@ -191,6 +191,16 @@ class Tenant:
     def may_provision(self) -> bool:
         return self.state in CLAIMABLE and self.gate_cleared
 
+    @property
+    def may_retry(self) -> bool:
+        """A run failed and left the tenant in `provisioning`; a human may queue another.
+
+        Never automatic: the play's certificate step spends issuance from a limit
+        shared by every tenant on the domain, so the decision to try again belongs to
+        whoever has read why it failed.
+        """
+        return self.state == PROVISIONING and bool(self.failed_step)
+
     def for_display(self) -> dict:
         out = {
             "tenant_id": self.tenant_id,
@@ -203,6 +213,7 @@ class Tenant:
             "state": self.state,
             "admits_logins": self.admits_logins,
             "may_provision": self.may_provision,
+            "may_retry": self.may_retry,
             "gate_cleared": self.gate_cleared,
             # What the doors would resolve this id to, and whether that is itself.
             "base_tenant_id": self.base_tenant_id,
@@ -246,7 +257,11 @@ class TenantRegistry(Protocol):
     def record_override(self, tenant_id: str, by: str, reason: str) -> Optional[Tenant]: ...
     def set_state(self, tenant_id: str, to: str, *, by: str, note: str) -> Optional[Tenant]: ...
     def claim_for_provisioning(self, tenant_id: str, by: str) -> Optional[Tenant]: ...
+    def claim_retry(self, tenant_id: str, by: str) -> Optional[Tenant]: ...
     def attach_job(self, tenant_id: str, job_id: str) -> None: ...
+    def complete_provisioning(self, tenant_id: str, job_id: str, by: str) -> Optional[Tenant]: ...
+    def record_provisioning_failure(self, tenant_id: str, job_id: str, *, step: str,
+                                    detail: str, retry_safe: bool) -> Optional[Tenant]: ...
 
 
 # ── the columns this console adds ──────────────────────────────────────────
@@ -515,6 +530,63 @@ class PostgresTenantRegistry:
                             "WHERE tenant_id = %s", (job_id, tenant_id))
             conn.commit()
 
+    def claim_retry(self, tenant_id: str, by: str) -> Optional[Tenant]:
+        """Clear a recorded failure so another run can be queued, ATOMICALLY.
+
+        Same shape as the first claim: one conditional UPDATE, so two administrators
+        pressing Retry cannot both queue a run. Only a tenant still in `provisioning`
+        WITH a failure qualifies — a run in flight has none recorded yet, and that is
+        what stops a retry from overlapping it.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE public.tenants SET failed_step = '', failure_detail = '', "
+                    f"retry_safe = false, state_by = %s, updated_at = now() "
+                    f"WHERE tenant_id = %s AND state = %s AND failed_step <> '' "
+                    f"RETURNING {_COLS}",
+                    (by, tenant_id, PROVISIONING))
+                row = cur.fetchone()
+            conn.commit()
+        return _row(row) if row else None
+
+    def complete_provisioning(self, tenant_id: str, job_id: str, by: str) -> Optional[Tenant]:
+        """The runner's success: `provisioning` -> `live`, for THIS job only.
+
+        Conditional on the job id as well as the state, so a run that finishes after
+        an administrator has re-queued (or after someone moved the tenant by hand)
+        cannot promote a tenant it no longer owns.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE public.tenants SET state = %s, state_since = now(), "
+                    f"state_by = %s, failed_step = '', failure_detail = '', "
+                    f"retry_safe = false, updated_at = now() "
+                    f"WHERE tenant_id = %s AND state = %s AND job_id = %s "
+                    f"RETURNING {_COLS}",
+                    (LIVE, by, tenant_id, PROVISIONING, job_id))
+                row = cur.fetchone()
+            conn.commit()
+        return _row(row) if row else None
+
+    def record_provisioning_failure(self, tenant_id: str, job_id: str, *, step: str,
+                                    detail: str, retry_safe: bool) -> Optional[Tenant]:
+        """The runner's failure. The state STAYS `provisioning` (no `failed` exists,
+        and only `live` admits), with the step and detail filled in."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE public.tenants SET failed_step = %s, failure_detail = %s, "
+                    f"retry_safe = %s, updated_at = now() "
+                    f"WHERE tenant_id = %s AND state = %s AND job_id = %s "
+                    f"RETURNING {_COLS}",
+                    (step or "unknown step", detail, bool(retry_safe), tenant_id,
+                     PROVISIONING, job_id))
+                row = cur.fetchone()
+            conn.commit()
+        return _row(row) if row else None
+
 
 @dataclass
 class StaticTenantRegistry:
@@ -621,6 +693,32 @@ class StaticTenantRegistry:
     def attach_job(self, tenant_id: str, job_id: str) -> None:
         self._guard()
         self._replace(tenant_id, job_id=job_id)
+
+    def claim_retry(self, tenant_id: str, by: str) -> Optional[Tenant]:
+        self._guard()
+        t = self.rows.get(tenant_id)
+        if t is None or not t.may_retry:
+            return None
+        return self._replace(tenant_id, failed_step="", failure_detail="",
+                             retry_safe=False, state_by=by)
+
+    def complete_provisioning(self, tenant_id: str, job_id: str, by: str) -> Optional[Tenant]:
+        self._guard()
+        t = self.rows.get(tenant_id)
+        if t is None or t.state != PROVISIONING or t.job_id != job_id:
+            return None
+        return self._replace(tenant_id, state=LIVE, state_by=by, failed_step="",
+                             failure_detail="", retry_safe=False,
+                             state_since=_dt.datetime.now(_dt.timezone.utc).isoformat())
+
+    def record_provisioning_failure(self, tenant_id: str, job_id: str, *, step: str,
+                                    detail: str, retry_safe: bool) -> Optional[Tenant]:
+        self._guard()
+        t = self.rows.get(tenant_id)
+        if t is None or t.state != PROVISIONING or t.job_id != job_id:
+            return None
+        return self._replace(tenant_id, failed_step=step or "unknown step",
+                             failure_detail=detail, retry_safe=bool(retry_safe))
 
 
 def dsn_for(config: Config) -> str:

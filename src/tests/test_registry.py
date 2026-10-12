@@ -461,6 +461,30 @@ def test_live_request_and_claim(pg):
     assert pg.claim_for_provisioning("zztest-a", TEN) is None, "only once"
 
 
+
+@live
+def test_live_the_runner_lifecycle(pg):
+    """complete / failure / retry are each one conditional UPDATE; prove the SQL."""
+    pg.request(tenant_id="zztest-run", base_domain=BASE, address=ADDR,
+               initial_admin="a@acme.test", requested_by=TEN)
+    pg.record_override("zztest-run", TEN, "test")
+    assert pg.claim_for_provisioning("zztest-run", TEN).state == PROVISIONING
+    pg.attach_job("zztest-run", "job-7")
+    # Nothing to retry while the run is in flight.
+    assert pg.claim_retry("zztest-run", TEN) is None
+    # Another job's result cannot touch it.
+    assert pg.record_provisioning_failure("zztest-run", "job-6", step="x", detail="y",
+                                          retry_safe=True) is None
+    t = pg.record_provisioning_failure("zztest-run", "job-7", step="Obtain certificates",
+                                       detail="rate limited", retry_safe=False)
+    assert t.state == PROVISIONING and t.may_retry and t.failed_step == "Obtain certificates"
+    t = pg.claim_retry("zztest-run", TEN)
+    assert t is not None and t.failed_step == "" and not t.may_retry
+    assert pg.claim_retry("zztest-run", TEN) is None          # exactly one retry claim
+    pg.attach_job("zztest-run", "job-8")
+    assert pg.complete_provisioning("zztest-run", "job-7", "runner") is None
+    assert pg.complete_provisioning("zztest-run", "job-8", "runner").state == LIVE
+
 @live
 def test_live_duplicate_is_the_constraint(pg):
     pg.request(tenant_id="zztest-b", base_domain=BASE, address=ADDR,
@@ -696,6 +720,66 @@ def test_a_live_tenant_cannot_be_provisioned_again():
     # that did not happen.
     assert "a moment ago" not in detail
 
+
+
+# ── after the runner: live, failed, and retried ────────────────────────────
+
+
+def _provisioning(r: StaticTenantRegistry, job_id="job-1") -> Tenant:
+    _requested(r)
+    r.record_dns("acme", _passing_dns())
+    r.claim_for_provisioning("acme", TEN)
+    r.attach_job("acme", job_id)
+    return r.get("acme")
+
+
+def test_success_is_live_only_for_the_job_the_tenant_is_waiting_on():
+    r = StaticTenantRegistry()
+    _provisioning(r, "job-2")
+    assert r.complete_provisioning("acme", "job-1", "runner") is None
+    assert r.get("acme").state == PROVISIONING
+    assert r.complete_provisioning("acme", "job-2", "runner").state == LIVE
+
+
+def test_a_failure_stays_in_provisioning_and_offers_a_retry():
+    r = StaticTenantRegistry()
+    _provisioning(r)
+    t = r.record_provisioning_failure("acme", "job-1", step="Obtain certificates",
+                                      detail="rate limited", retry_safe=False)
+    assert t.state == PROVISIONING and not t.admits_logins
+    assert t.may_retry and not t.may_provision
+    assert t.for_display()["failure"] == {"step": "Obtain certificates",
+                                          "detail": "rate limited", "retry_safe": False}
+
+
+def test_a_run_in_flight_cannot_be_retried():
+    r = StaticTenantRegistry()
+    _provisioning(r)
+    assert not r.get("acme").may_retry
+    assert r.claim_retry("acme", TEN) is None
+
+
+def test_a_retry_through_the_api_queues_exactly_one_new_job():
+    c, r = _client()
+    c.post("/v1/tenants", headers=_hdr(c), json={
+        "tenant_id": "acme", "base_domain": BASE, "address": ADDR,
+        "initial_admin": "a@acme.test"})
+    c.post("/v1/tenants/acme/dns-check", headers=_hdr(c))
+    first = c.post("/v1/tenants/acme/provision", headers=_hdr(c)).json()["job"]["job_id"]
+    r.record_provisioning_failure("acme", first, step="Obtain certificates",
+                                  detail="rate limited", retry_safe=False)
+    assert c.get("/v1/tenants/acme", headers=_hdr(c)).json()["may_retry"] is True
+
+    again = c.post("/v1/tenants/acme/provision", headers=_hdr(c))
+    twice = c.post("/v1/tenants/acme/provision", headers=_hdr(c))
+    assert again.status_code == 202
+    job = again.json()["job"]
+    assert job["retry_of"] == first
+    assert job["previous_failure"]["step"] == "Obtain certificates"
+    assert twice.status_code == 409          # the retry claim is atomic too
+    assert r.get("acme").job_id == job["job_id"] and r.get("acme").failed_step == ""
+    jobs = c.get("/v1/provisioning-jobs", headers=_hdr(c)).json()["jobs"]
+    assert len(jobs) == 2
 
 # ── DNS and TLS together, on every subdomain ───────────────────────────────
 

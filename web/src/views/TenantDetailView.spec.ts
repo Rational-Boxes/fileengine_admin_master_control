@@ -120,3 +120,37 @@ describe('the status control', () => {
     expect(w.text()).not.toContain('Suspend acme')
   })
 })
+
+describe('a failed provisioning run', () => {
+  const failed = () => tenant({
+    state: 'provisioning', admits_logins: false, may_retry: true, job_id: 'job-1',
+    failure: { step: 'ingress_nginx : Obtain certificates', detail: 'rate limited', retry_safe: false },
+  })
+
+  it('shows the step and offers a retry to system_tenants', async () => {
+    const w = await view(failed())
+    expect(w.text()).toContain('ingress_nginx : Obtain certificates')
+    expect(w.find('[data-test="retry"]').exists()).toBe(true)
+  })
+
+  it('offers no retry to an observer', async () => {
+    const w = await view(failed(), [SYSTEM_OBSERVER])
+    expect(w.find('[data-test="retry"]').exists()).toBe(false)
+  })
+
+  it('obeys the server: no retry while may_retry is false', async () => {
+    const w = await view(tenant({ state: 'provisioning', admits_logins: false, may_retry: false }))
+    expect(w.find('[data-test="retry"]').exists()).toBe(false)
+  })
+
+  it('queues a new job when pressed', async () => {
+    const after = tenant({ state: 'provisioning', admits_logins: false, job_id: 'job-2' })
+    const prov = vi.spyOn(tenants, 'provision').mockResolvedValue({ job: { job_id: 'job-2' }, tenant: after })
+    const w = await view(failed())
+    await w.find('[data-test="retry"]').trigger('click')
+    await flushPromises()
+    expect(prov).toHaveBeenCalledWith('acme')
+    expect(w.text()).toContain('Queued job-2')
+    expect(w.find('[data-test="retry"]').exists()).toBe(false)
+  })
+})

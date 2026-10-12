@@ -62,10 +62,24 @@ class StoreUnavailable(RuntimeError):
     """
 
 
+#: The runner's vocabulary for a job, after `queued`.
+QUEUED, CLAIMED, DONE, FAILED = "queued", "claimed", "done", "failed"
+FINISHED = (DONE, FAILED)
+
+
 class JobStore(Protocol):
     def ensure_schema(self) -> None: ...
     def record(self, tenant_id: str, job: dict) -> str: ...
     def jobs(self, *, limit: int = 100) -> list[dict]: ...
+    def claim_next(self, runner: str) -> Optional[dict]: ...
+    def finish(self, job_id: str, *, state: str, detail: str) -> bool: ...
+
+
+def _job_number(job_id: str) -> int:
+    """`job-12` -> 12. The id is shown to people as `job-N`; the row key is N."""
+    if not job_id.startswith("job-") or not job_id[4:].isdigit():
+        raise ValueError(f"not a job id: {job_id!r}")
+    return int(job_id[4:])
 
 
 _JOB_DDL = """
@@ -145,16 +159,52 @@ class PostgresJobStore:
     def jobs(self, *, limit: int = 100) -> list[dict]:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, tenant_id, payload, requested_by, state, "
-                        "claimed_by, detail FROM provisioning_job "
+                        "claimed_by, detail, claimed_at, finished_at FROM provisioning_job "
                         "ORDER BY id DESC LIMIT %s", (limit,))
             rows = cur.fetchall()
-        out = []
-        for jid, tid, payload, by, st, claimed_by, detail in rows:
-            p = payload if isinstance(payload, dict) else json.loads(payload)
-            p.update({"job_id": f"job-{jid}", "tenant_id": tid, "requested_by": by,
-                      "state": st, "claimed_by": claimed_by, "detail": detail})
-            out.append(p)
-        return out
+        return [_out(r) for r in rows]
+
+    def claim_next(self, runner: str) -> Optional[dict]:
+        """Take the oldest queued job, or None. Safe with several runners.
+
+        `FOR UPDATE SKIP LOCKED` inside the sub-select: a second runner polling at
+        the same moment skips the row the first has locked rather than waiting for
+        it and then claiming it too.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE provisioning_job SET state = %s, claimed_by = %s, "
+                    "claimed_at = now() WHERE id = (SELECT id FROM provisioning_job "
+                    "WHERE state = %s ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
+                    "RETURNING id, tenant_id, payload, requested_by, state, claimed_by, "
+                    "detail, claimed_at, finished_at",
+                    (CLAIMED, runner, QUEUED))
+                row = cur.fetchone()
+            conn.commit()
+        return _out(row) if row else None
+
+    def finish(self, job_id: str, *, state: str, detail: str) -> bool:
+        """`claimed` -> `done` | `failed`. False if the job was not claimed."""
+        if state not in FINISHED:
+            raise ValueError(f"a job finishes as one of {FINISHED}, not {state!r}")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE provisioning_job SET state = %s, detail = %s, "
+                            "finished_at = now() WHERE id = %s AND state = %s",
+                            (state, detail, _job_number(job_id), CLAIMED))
+                changed = cur.rowcount == 1
+            conn.commit()
+        return changed
+
+
+def _out(r) -> dict:
+    jid, tid, payload, by, st, claimed_by, detail, claimed_at, finished_at = r
+    p = payload if isinstance(payload, dict) else json.loads(payload)
+    p.update({"job_id": f"job-{jid}", "tenant_id": tid, "requested_by": by,
+              "state": st, "claimed_by": claimed_by, "detail": detail,
+              "claimed_at": str(claimed_at or ""), "finished_at": str(finished_at or "")})
+    return p
 
 
 @dataclass
@@ -175,6 +225,22 @@ class InMemoryJobStore:
 
     def jobs(self, *, limit: int = 100) -> list[dict]:
         return list(reversed(self.rows))[:limit]
+
+    def claim_next(self, runner: str) -> Optional[dict]:
+        for row in self.rows:
+            if row["state"] == QUEUED:
+                row.update({"state": CLAIMED, "claimed_by": runner})
+                return dict(row)
+        return None
+
+    def finish(self, job_id: str, *, state: str, detail: str) -> bool:
+        if state not in FINISHED:
+            raise ValueError(f"a job finishes as one of {FINISHED}, not {state!r}")
+        for row in self.rows:
+            if row["job_id"] == job_id and row["state"] == CLAIMED:
+                row.update({"state": state, "detail": detail})
+                return True
+        return False
 
 
 def dsn_for(config: Config) -> str:

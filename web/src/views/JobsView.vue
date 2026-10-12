@@ -35,9 +35,10 @@ function cls(state: string) {
   <div>
     <h1>Provisioning</h1>
     <p class="sub">
-      The queue a runner claims from. This console writes the job and stops there —
-      the runner holds the vault password and the inventory, which is why neither is
-      reachable from here.
+      The queue the provisioning runner claims from. This console writes the job and
+      stops there; the runner, a separate process on the server that holds the deploy
+      secrets, runs the tenant play and writes back what happened. A failed run keeps
+      its step here and on the tenant's page, where it can be retried.
     </p>
 
     <div v-if="error" class="notice bad">{{ error }}</div>
@@ -70,6 +71,8 @@ function cls(state: string) {
             <span class="pill" :class="cls(j.state)">{{ j.state }}</span>
             <div v-if="j.claimed_by" class="muted small">by {{ j.claimed_by }}</div>
             <div v-if="j.detail" class="muted small">{{ j.detail }}</div>
+            <div v-if="j.finished_at" class="muted small">finished {{ j.finished_at }}</div>
+            <div v-if="j.retry_of" class="muted small">retry of {{ j.retry_of }}</div>
           </td>
           <td class="muted small">{{ j.requested_by }}</td>
           <td>

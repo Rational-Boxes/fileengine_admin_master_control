@@ -1023,6 +1023,20 @@ def build_router(config: Config, registry: AdministratorRegistry,
         except RegistryUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail=str(e)) from e
+        retry = False
+        if claimed is None:
+            # A RETRY: the last run failed and left the tenant in `provisioning`
+            # with the failing step recorded. Re-queued only by a person pressing
+            # this, never by the runner — the play's certificate step spends
+            # issuance shared by every tenant on the domain.
+            now = _must_get(tenant_id)
+            if now.may_retry:
+                try:
+                    claimed = _registry.claim_retry(tenant_id, principal.subject)
+                except RegistryUnavailable as e:
+                    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                        detail=str(e)) from e
+                retry = claimed is not None
         if claimed is None:
             # WHICH refusal matters. An earlier version let the job builder produce
             # this message, which told the second presser "the DNS gate has not
@@ -1058,6 +1072,10 @@ def build_router(config: Config, registry: AdministratorRegistry,
             dns_verified=bool((before.dns or {}).get("ok")),
             override_by=claimed.override_by, override_reason=claimed.override_reason)
         job["authorised_as"] = authorised_as
+        if retry:
+            job["retry_of"] = before.job_id
+            job["previous_failure"] = {"step": before.failed_step,
+                                       "detail": before.failure_detail}
         try:
             job["job_id"] = _jobs.record(tenant_id, job)
             _registry.attach_job(tenant_id, job["job_id"])
