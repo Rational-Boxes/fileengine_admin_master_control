@@ -205,6 +205,23 @@ def summarise(rc: int, output: str) -> Outcome:
 Executor = Callable[[list, str, str, int], tuple]
 
 
+#: Set by systemd for every process in a unit. podman reads it as "I am this
+#: unit's container" and leaves conmon in the unit's cgroup instead of giving it
+#: its own libpod-conmon scope — so every container a play (re)creates would
+#: belong to the runner, and the next stop or restart of the runner SIGKILLs
+#: their conmon. Measured in production 2026-10-12: job-1 recreated MCP, the
+#: runner was redeployed, and MCP's conmon went with it.
+_UNIT_ENV = ("INVOCATION_ID",)
+
+
+def play_env(base: Optional[dict] = None) -> dict:
+    """The play's environment: the runner's, minus what ties containers to its unit."""
+    env = dict(os.environ if base is None else base)
+    for k in _UNIT_ENV:
+        env.pop(k, None)
+    return env
+
+
 def run_play(argv: list, cwd: str, log_path: str, timeout_s: int) -> tuple:
     """Run the play, teeing its output to a 0600 log on this host. (rc, output)."""
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -212,7 +229,8 @@ def run_play(argv: list, cwd: str, log_path: str, timeout_s: int) -> tuple:
         # Blocking stdio: Ansible refuses a non-blocking stdin/stdout. A regular file
         # and /dev/null are both blocking.
         proc = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf,
-                              stderr=subprocess.STDOUT, timeout=timeout_s, check=False)
+                              stderr=subprocess.STDOUT, timeout=timeout_s, check=False,
+                              env=play_env())
     with open(log_path, encoding="utf-8", errors="replace") as f:
         return proc.returncode, f.read()
 

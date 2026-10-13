@@ -231,3 +231,20 @@ def test_the_web_package_still_cannot_execute_anything():
 def test_summarise_reads_success():
     o = r.summarise(0, OK_OUTPUT)
     assert o.ok and o.welcome_to == "james@rationalboxes.com"
+
+
+def test_play_env_drops_the_unit_marker_so_containers_do_not_belong_to_the_runner():
+    from admin_master_control_runner.runner import play_env
+
+    env = play_env({"INVOCATION_ID": "abc", "PATH": "/usr/bin", "DEPLOY_ENV": "do"})
+    assert "INVOCATION_ID" not in env
+    assert env["PATH"] == "/usr/bin" and env["DEPLOY_ENV"] == "do"
+
+
+def test_run_play_passes_the_scrubbed_environment(tmp_path, monkeypatch):
+    from admin_master_control_runner import runner as R
+
+    monkeypatch.setenv("INVOCATION_ID", "abc")
+    rc, out = R.run_play(["sh", "-c", "echo inv=${INVOCATION_ID:-none}"], str(tmp_path),
+                         str(tmp_path / "log"), 30)
+    assert rc == 0 and "inv=none" in out
