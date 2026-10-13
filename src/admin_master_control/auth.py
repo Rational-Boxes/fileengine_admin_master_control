@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Optional, Protocol, Sequence
 
 import jwt
@@ -106,6 +106,10 @@ class Principal:
     roles: frozenset[str] = frozenset()
     amr: tuple[str, ...] = ()
     jti: str = ""
+    #: The bearer this request presented, so a call made on the administrator's
+    #: behalf (the audit ledger) can carry THEIR session rather than a standing
+    #: credential. Never printed, never compared.
+    token: str = field(default="", repr=False, compare=False)
 
     @property
     def has_second_factor(self) -> bool:
@@ -551,7 +555,8 @@ def principal_from_header(config: Config, authorization: Optional[str]) -> Princ
     """Verify the bearer and enforce the tier's non-negotiables."""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise AuthError("no bearer token")
-    principal = verify_token(config, authorization.split(None, 1)[1].strip())
+    raw = authorization.split(None, 1)[1].strip()
+    principal = replace(verify_token(config, raw), token=raw)
 
     if config.require_mfa and not principal.has_second_factor:
         # §6: MFA is mandatory at this tier, not policy-dependent. Enforced on
