@@ -275,3 +275,72 @@ def test_aggregated_and_campaigns_are_callable_without_http():
                                 distinct_values=["a", "b"])])
     assert aggregated(src)["counts"]["total"] == 1
     assert campaigns(src)["widest_fanout"] == 2
+
+
+# ── the ledger is asked AS the administrator ───────────────────────────────
+# audit_service admits the console's own session as a deployment identity, so
+# the console forwards it. Production 2026-10-12: with no token forwarded and no
+# AMC_AUDIT_TOKEN set, every call was 401 and the view read "audit ledger
+# unavailable" with nothing wrong in the ledger at all.
+
+
+class _Resp:
+    def __init__(self, body):
+        self.status_code, self._body, self.text = 200, body, ""
+
+    def json(self):
+        return self._body
+
+
+def _capture(monkeypatch, body=None):
+    import httpx
+
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((method, url, dict(kw.get("headers") or {})))
+        return _Resp(body if body is not None else {"incidents": [], "items": []})
+
+    monkeypatch.setattr(httpx, "request", fake)
+    return seen
+
+
+def test_the_security_view_forwards_the_callers_own_session(monkeypatch):
+    from admin_master_control.incidents import AuditServiceIncidents
+
+    seen = _capture(monkeypatch)
+    client = _client(source=AuditServiceIncidents(base_url="http://audit:8097"))
+    headers = _tok(client)
+    r = client.get("/v1/security/incidents", headers=headers)
+    assert r.status_code == 200 and r.json()["incidents"] == []
+    assert seen and seen[0][2]["Authorization"] == headers["Authorization"]
+
+
+def test_each_administrator_is_forwarded_as_themselves(monkeypatch):
+    from admin_master_control.incidents import AuditServiceIncidents
+
+    seen = _capture(monkeypatch)
+    client = _client(source=AuditServiceIncidents(base_url="http://audit:8097",
+                                                  token="standing-credential"))
+    mine = _tok(client)
+    client.get("/v1/security/queue", headers=mine)
+    assert seen[-1][2]["Authorization"] == mine["Authorization"]
+    assert "standing-credential" not in seen[-1][2]["Authorization"]
+
+
+def test_an_empty_ledger_reads_as_no_incidents_not_unavailable(monkeypatch):
+    from admin_master_control.incidents import AuditServiceIncidents
+
+    _capture(monkeypatch, {"incidents": []})
+    client = _client(source=AuditServiceIncidents(base_url="http://audit:8097"))
+    r = client.get("/v1/security/incidents", headers=_tok(client))
+    assert r.status_code == 200
+    assert r.json()["counts"]["total"] == 0
+
+
+def test_the_principal_never_prints_its_token():
+    from admin_master_control.auth import Principal
+
+    p = Principal(subject="james", token="eyJ.secret.sig")
+    assert "secret" not in repr(p)
+    assert p == Principal(subject="james")

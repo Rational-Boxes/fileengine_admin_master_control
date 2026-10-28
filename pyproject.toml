@@ -31,6 +31,9 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0", "httpx>=0.27"]
 
 [project.scripts]
 admin-master-control = "admin_master_control.app:main"   # API (:8103), monitoring (:8104)
+# The runner: a separate package and a separate process, on the host that holds the
+# deploy secrets. No HTTP surface. See admin_master_control_runner/__init__.py.
+amc-provisioner = "admin_master_control_runner.runner:main"
 
 [build-system]
 requires = ["setuptools>=61"]

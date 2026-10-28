@@ -40,7 +40,7 @@ audit read to `system_observer`/`system_security` instead.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Optional, Protocol
 
 log = logging.getLogger("admin_master_control.incidents")
@@ -87,6 +87,17 @@ class AuditServiceIncidents:
     base_url: str
     token: str = ""
     timeout_s: float = 10.0
+
+    def for_caller(self, token: str) -> "AuditServiceIncidents":
+        """This source, speaking as the signed-in administrator.
+
+        audit_service admits the console's session as a deployment identity
+        (AUDIT_DEPLOYMENT_JWT_SECRET), so the ledger checks the caller's own
+        roles and second factor, and an acknowledgement is recorded under their
+        name — not a shared credential's. The static AMC_AUDIT_TOKEN, if any, is
+        only the fallback for a call with no caller.
+        """
+        return replace(self, token=token or self.token)
 
     def _call(self, method: str, path: str, *, params=None, json=None) -> dict:
         import httpx

@@ -132,6 +132,8 @@ export interface TenantView {
   admits_logins: boolean
   /** THE SERVER'S JUDGEMENT on the DNS gate. Never recomputed here. */
   may_provision: boolean
+  /** A run failed and a person may queue another. THE SERVER'S judgement too. */
+  may_retry?: boolean
   gate_cleared: boolean
   /** False for every tenant that predates this console — the normal case. */
   requested_here: boolean

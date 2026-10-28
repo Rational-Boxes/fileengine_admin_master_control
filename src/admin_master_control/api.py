@@ -522,11 +522,15 @@ def build_router(config: Config, registry: AdministratorRegistry,
     # its own area, and an incident naming a source address and the tenants it
     # touched is more than a read-only baseline should see.
 
-    def _ledger():
+    def _ledger(principal: Principal):
         if incidents is None:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail="no audit ledger configured")
-        return incidents
+        # As the administrator asking, not as this application: see
+        # AuditServiceIncidents.for_caller. Sources without callers (tests, the
+        # unconfigured refusal) are used as they are.
+        bind = getattr(incidents, "for_caller", None)
+        return bind(principal.token) if bind and principal.token else incidents
 
     @r.get("/security/incidents")
     def security_incidents(limit: int = 100, min_severity: str | None = None,
@@ -534,7 +538,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
                            principal: Principal = Depends(require(SYSTEM_SECURITY))):
         """Every incident from every tenant, severity-ranked (§3.4 aggregation)."""
         try:
-            return aggregated(_ledger(), limit=max(1, min(limit, 500)),
+            return aggregated(_ledger(principal), limit=max(1, min(limit, 500)),
                               min_severity=min_severity, status=status_filter)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -556,7 +560,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         the only view in which the campaign exists at all.
         """
         try:
-            return campaigns(_ledger(), limit=max(1, min(limit, 500)))
+            return campaigns(_ledger(principal), limit=max(1, min(limit, 500)))
         except LedgerUnavailable as e:
             log.error("campaign view unavailable: %s", e)
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -573,7 +577,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         hard-coding the procedure and drifting from it.
         """
         try:
-            return _ledger().queue(state=state, limit=max(1, min(limit, 500)))
+            return _ledger(principal).queue(state=state, limit=max(1, min(limit, 500)))
         except LedgerUnavailable as e:
             log.error("queue unavailable: %s", e)
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -589,7 +593,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         that cannot be satisfied by sending more email.
         """
         try:
-            return _ledger().backlog(older_than_hours=older_than_hours)
+            return _ledger(principal).backlog(older_than_hours=older_than_hours)
         except LedgerUnavailable as e:
             log.error("backlog unavailable: %s", e)
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -600,7 +604,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
                       principal: Principal = Depends(require(SYSTEM_SECURITY))):
         """One item's full transition history, refusals included."""
         try:
-            return _ledger().item_history(incident_id)
+            return _ledger(principal).item_history(incident_id)
         except LedgerUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail="audit ledger unavailable") from e
@@ -621,7 +625,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         """
         authorised_as = principal.authorising(SYSTEM_SECURITY)
         try:
-            out = _ledger().transition(
+            out = _ledger(principal).transition(
                 incident_id=body.incident_id, state=body.state, actor=principal.subject,
                 reason=body.reason, counterparty=body.counterparty, evidence=body.evidence)
         except TransitionRefused as e:
@@ -661,7 +665,7 @@ def build_router(config: Config, registry: AdministratorRegistry,
         if incidents is not None:
             # States come from the acknowledgement queue, keyed by erasure_id.
             try:
-                for item in (incidents.queue(limit=500).get("items") or []):
+                for item in (_ledger(principal).queue(limit=500).get("items") or []):
                     key = item.get("group_key")
                     if key:
                         states[key] = {"state": item.get("state"),
@@ -1023,6 +1027,20 @@ def build_router(config: Config, registry: AdministratorRegistry,
         except RegistryUnavailable as e:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                                 detail=str(e)) from e
+        retry = False
+        if claimed is None:
+            # A RETRY: the last run failed and left the tenant in `provisioning`
+            # with the failing step recorded. Re-queued only by a person pressing
+            # this, never by the runner — the play's certificate step spends
+            # issuance shared by every tenant on the domain.
+            now = _must_get(tenant_id)
+            if now.may_retry:
+                try:
+                    claimed = _registry.claim_retry(tenant_id, principal.subject)
+                except RegistryUnavailable as e:
+                    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                        detail=str(e)) from e
+                retry = claimed is not None
         if claimed is None:
             # WHICH refusal matters. An earlier version let the job builder produce
             # this message, which told the second presser "the DNS gate has not
@@ -1058,6 +1076,10 @@ def build_router(config: Config, registry: AdministratorRegistry,
             dns_verified=bool((before.dns or {}).get("ok")),
             override_by=claimed.override_by, override_reason=claimed.override_reason)
         job["authorised_as"] = authorised_as
+        if retry:
+            job["retry_of"] = before.job_id
+            job["previous_failure"] = {"step": before.failed_step,
+                                       "detail": before.failure_detail}
         try:
             job["job_id"] = _jobs.record(tenant_id, job)
             _registry.attach_job(tenant_id, job["job_id"])

@@ -57,6 +57,27 @@ async function applyState() {
   }
 }
 
+// A retry is a person's decision, never the runner's: the certificate step spends
+// issuance shared by every tenant on the domain. Gated on the SERVER'S may_retry.
+const mayRetry = computed(() => !!t.value?.may_retry && s.has(SYSTEM_TENANTS))
+const retrying = ref(false)
+const retried = ref('')
+
+async function retry() {
+  if (!t.value || !mayRetry.value) return
+  retrying.value = true
+  error.value = ''
+  try {
+    const out = await tenants.provision(t.value.tenant_id)
+    retried.value = String(out.job.job_id ?? '')
+    t.value = out.tenant
+  } catch (e) {
+    error.value = apiError(e)
+  } finally {
+    retrying.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     t.value = await tenants.get(String(route.params.id))
@@ -202,7 +223,16 @@ function copyZone() {
         <p class="pill" :class="t.failure.retry_safe ? 'ok' : 'bad'">
           {{ t.failure.retry_safe ? 'safe to retry' : 'not safe to retry' }}
         </p>
+        <p v-if="!t.failure.retry_safe" class="muted small">
+          The run had already changed the host when it stopped. The play is idempotent, so
+          running it again converges — but if this was the certificate step, every retry
+          spends issuance shared by every tenant on the domain. Read the log on the host first.
+        </p>
+        <button v-if="mayRetry" class="btn" data-test="retry" :disabled="retrying" @click="retry">
+          {{ retrying ? 'Queuing…' : 'Retry provisioning' }}
+        </button>
       </section>
+      <div v-if="retried" class="notice ok">Queued {{ retried }} for the runner.</div>
 
       <section class="card">
         <h2>Details</h2>
